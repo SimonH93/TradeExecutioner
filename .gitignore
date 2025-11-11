@@ -1,0 +1,7 @@
+# Python virtual environments
+.venv/
+venv/
+
+# Logs & temporary files
+*.log
+*.tmp
