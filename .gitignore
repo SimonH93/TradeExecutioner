@@ -5,3 +5,4 @@ venv/
 # Logs & temporary files
 *.log
 *.tmp
+*.env
