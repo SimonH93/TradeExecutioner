@@ -142,7 +142,7 @@ async def tg_webhook(req: Request):
         return {"ok": True}
     enqueue_signal(signal)                # push to Redis queue (Huey/RQ)
     return {"ok": True}
-```
+``
 
 Worker (Huey / async):
 

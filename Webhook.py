@@ -11,4 +11,4 @@ async def tg_webhook(req: Request):
         notify_admin("invalid signal")
         return {"ok": True}
     enqueue_signal(signal)                # push to Redis queue (Huey/RQ)
-    return {"ok": True}
+    return {"ok": True} 
