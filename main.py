@@ -29,6 +29,7 @@ def parse_signal(text: str):
         # PAIR
         pair_match = re.search(r"PAIR:\s*(\w+/\w+)", text)
         pair = pair_match.group(1) if pair_match else None
+        symbol = pair.replace("/", "") if pair else None  # Bitget Format
 
         # POSITION SIZE
         size_match = re.search(r"POSITION SIZE:\s*(\d+\s*-\s*\d+%)", text)
