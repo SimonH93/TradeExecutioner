@@ -3,6 +3,11 @@ import re
 import os
 from dotenv import load_dotenv
 import requests
+import time
+import hmac
+import hashlib
+import base64
+import json
 
 
 app = FastAPI()
@@ -17,6 +22,8 @@ BITGET_PASSWORD = os.getenv("BITGET_PASSWORD")
 
 USDT_BUDGET = float(os.getenv("BITGET_USDT_SIZE") or 10)
 DEFAULT_LEVERAGE = float(os.getenv("BITGET_LEVERAGE", 1))
+TEST_MODE = os.getenv("BITGET_TEST_MODE", "True").lower() == "true"
+
 
 # Base URL für Bitget Futures
 BASE_URL = "https://api.bitget.com"
@@ -39,7 +46,7 @@ async def telegram_webhook(req: Request):
     
     if signal:
         print("Signal erkannt:", signal)
-        # Hier könntest du es an Worker / Queue weitergeben
+        place_bitget_trade(signal, test_mode=TEST_MODE)
     else:
         print("Keine valide Nachricht")
     
@@ -73,14 +80,14 @@ def get_position_size(symbol: str, usdt_budget: float = None, leverage: float = 
     # Aktueller Preis
     price = get_current_price(symbol, product_type)
     total_size = (usdt_budget * leverage) / price
-    total_size = round(total_size, 6)
+    total_size = round(total_size, 8)
 
     # Teilpositionen für Take-Profit
     tp_sizes = [
-        round(total_size * 0.4, 6),  # TP1 = 40%
-        round(total_size * 0.3, 6),  # TP2 = 30%
-        round(total_size * 0.3, 6)   # TP3 = 30%
+        round(total_size * 0.5, 8),  # TP1 = 50%
+        round(total_size * 0.3, 8),  # TP2 = 30%
     ]
+    tp_sizes.append(round(total_size - sum(tp_sizes), 8))  # Rest in TP3
 
     print(f"[DEBUG] get_position_size: symbol={symbol}, price={price}, usdt_budget={usdt_budget}, "
           f"leverage={leverage}, total_size={total_size}, tp_sizes={tp_sizes}")
@@ -169,3 +176,121 @@ def parse_signal(text: str):
         print("Parsing Error:", e)
     
     return None
+
+def sign_request(method, request_path, timestamp, body=""):
+    message = f"{timestamp}{method.upper()}{request_path}{body}"
+    h = hmac.new(BITGET_API_SECRET.encode(), message.encode(), hashlib.sha256)
+    return base64.b64encode(h.digest()).decode()
+
+def place_market_order(symbol, size, side="buy", leverage=10):
+    url_path = "/api/mix/v1/order/placeOrder"
+    url = f"{BASE_URL}{url_path}"
+    timestamp = str(int(time.time() * 1000))
+
+    payload = {
+        "symbol": symbol,
+        "size": size,
+        "side": side,             # "buy" oder "sell"
+        "orderType": "market",
+        "tradeMode": "isolated",  # isolierter Margin-Modus
+        "leverage": leverage,
+        "marginCoin": "USDT"
+    }
+    body = json.dumps(payload)
+    signature = sign_request("POST", url_path, timestamp, body)
+
+    headers = {
+        "ACCESS-KEY": BITGET_API_KEY,
+        "ACCESS-SIGN": signature,
+        "ACCESS-TIMESTAMP": timestamp,
+        "ACCESS-PASSPHRASE": BITGET_PASSWORD,
+        "Content-Type": "application/json"
+    }
+
+    try:
+        resp = requests.post(url, headers=headers, data=body, timeout=5)
+        data = resp.json()  # Bitget gibt immer JSON zurück
+        if data.get("code") != "00000":
+            print("[ERROR] Bitget API response:", data)
+            return None
+        return data
+    except requests.RequestException as e:
+        print("[ERROR] Request failed:", e)
+        return None
+
+
+
+def place_trigger_order(symbol, size, trigger_price, side, order_type="limit"):
+    url_path = "/api/mix/v1/order/placeOrder"
+    url = f"{BASE_URL}{url_path}"
+    timestamp = str(int(time.time() * 1000))
+
+    payload = {
+        "symbol": symbol,
+        "size": size,
+        "side": side,          # z.B. "sell" für TP/SL
+        "orderType": order_type,
+        "tradeSide": "close",  # schließt die Position
+        "triggerPrice": trigger_price,
+        "orderPrice": trigger_price if order_type=="limit" else None,
+        "marginCoin": "USDT"
+    }
+    if payload["orderPrice"] is None:
+        payload.pop("orderPrice")
+
+    body = json.dumps(payload)
+    signature = sign_request("POST", url_path, timestamp, body)
+
+    headers = {
+        "ACCESS-KEY": BITGET_API_KEY,
+        "ACCESS-SIGN": signature,
+        "ACCESS-TIMESTAMP": timestamp,
+        "ACCESS-PASSPHRASE": BITGET_PASSWORD,
+        "Content-Type": "application/json"
+    }
+
+    try:
+        resp = requests.post(url, headers=headers, data=body, timeout=5)
+        data = resp.json()  # Bitget gibt immer JSON zurück
+        if data.get("code") != "00000":
+            print("[ERROR] Bitget Trigger Order API response:", data)
+            return None
+        return data
+    except requests.RequestException as e:
+        print("[ERROR] Request failed:", e)
+        return None
+    
+    
+def place_bitget_trade(signal, test_mode=True):
+    symbol = signal["symbol"]
+    position_size = signal["position_size"]
+    tp_sizes = signal["tp_sizes"]
+    side = "buy" if signal["type"].upper() == "LONG" else "sell"
+    leverage = signal["leverage"]
+    sl_price = signal["sl"]
+    tp_prices = signal["tps"]
+
+    print(f"[INFO] Platzieren Market Order: {side} {position_size} {symbol} (Leverage={leverage})")
+
+    if test_mode:
+        print("[TEST MODE] Market Order, SL und TP Orders werden nicht gesendet")
+        return
+
+    market_side = "buy" if signal["type"].upper() == "LONG" else "sell"
+    trigger_side = "sell" if market_side == "buy" else "buy"
+
+    # --- 1. Market Order platzieren ---
+    market_order_resp = place_market_order(symbol, position_size, side=market_side, leverage=leverage)
+    print("Market Order Response:", market_order_resp)
+
+    # Optional: warten bis Order ausgeführt
+    time.sleep(0.5)
+
+    # --- 2. Stop-Loss Order ---
+    sl_resp = place_trigger_order(symbol, position_size, sl_price, side=trigger_side, order_type="market")
+    print("Stop-Loss Order Response:", sl_resp)
+
+    # --- 3. Take-Profit Orders ---
+    for tp_price, tp_size in zip(tp_prices, tp_sizes):
+        tp_resp = place_trigger_order(symbol, tp_size, tp_price, side=trigger_side, order_type="limit")
+        print(f"TP Order {tp_price} Response:", tp_resp)
