@@ -58,7 +58,6 @@ def get_current_price(symbol: str, product_type: str = "USDT-FUTURES") -> float:
         raise Exception(f"API error: {data}")
 
     try:
-        # data["data"] ist eine Liste → erstes Element auswählen
         ticker_info = data["data"][0]
         price = float(ticker_info["lastPr"])
         print(f"[DEBUG] get_current_price: {symbol} = {price}")
@@ -67,17 +66,27 @@ def get_current_price(symbol: str, product_type: str = "USDT-FUTURES") -> float:
         raise Exception(f"Unexpected response: {data}")
 
 
-def get_position_size(symbol: str, usdt_budget: float = None, leverage: float = None, product_type: str = "USDT-FUTURES") -> float:
+def get_position_size(symbol: str, usdt_budget: float = None, leverage: float = None, product_type: str = "USDT-FUTURES"):
     usdt_budget = usdt_budget or USDT_BUDGET
     leverage = leverage or DEFAULT_LEVERAGE
 
+    # Aktueller Preis
     price = get_current_price(symbol, product_type)
-    base_amount = (usdt_budget * leverage) / price
-    base_amount = round(base_amount, 6)
+    total_size = (usdt_budget * leverage) / price
+    total_size = round(total_size, 6)
+
+    # Teilpositionen für Take-Profit
+    tp_sizes = [
+        round(total_size * 0.4, 6),  # TP1 = 40%
+        round(total_size * 0.3, 6),  # TP2 = 30%
+        round(total_size * 0.3, 6)   # TP3 = 30%
+    ]
 
     print(f"[DEBUG] get_position_size: symbol={symbol}, price={price}, usdt_budget={usdt_budget}, "
-          f"leverage={leverage}, calculated_size={base_amount}")
-    return base_amount
+          f"leverage={leverage}, total_size={total_size}, tp_sizes={tp_sizes}")
+    
+    return total_size, tp_sizes
+
 
 
 def validate_trade(position_type, entry_price, stop_loss, take_profits, current_price):
@@ -137,7 +146,9 @@ def parse_signal(text: str):
             return None  # Pflichtfelder fehlen
         
         current_price = get_current_price(symbol)
-        position_size = get_position_size(symbol, leverage=leverage)
+        # Position berechnen + TP-Aufteilung
+        position_size, tp_sizes = get_position_size(symbol, leverage=leverage)
+        print(f"[DEBUG] Total position size: {position_size}, TP split sizes: {tp_sizes}")
 
 
         if not validate_trade(position_type, entry_price, stop_loss, take_profits, current_price):
@@ -147,6 +158,7 @@ def parse_signal(text: str):
         return {
             "symbol": symbol,
             "position_size": position_size,
+            "tp_sizes": tp_sizes,
             "type": position_type,
             "entry": entry_price,
             "sl": stop_loss,
