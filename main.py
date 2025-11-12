@@ -3,7 +3,6 @@ import re
 import os
 from dotenv import load_dotenv
 import requests
-import hmac, hashlib, time
 
 
 app = FastAPI()
@@ -16,10 +15,12 @@ BITGET_API_KEY = os.getenv("BITGET_API_KEY")
 BITGET_API_SECRET = os.getenv("BITGET_API_SECRET")
 BITGET_PASSWORD = os.getenv("BITGET_PASSWORD")
 
+USDT_BUDGET = float(os.getenv("BITGET_USDT_SIZE") or 10)
+DEFAULT_LEVERAGE = float(os.getenv("BITGET_LEVERAGE", 1))
+
 # Base URL für Bitget Futures
 BASE_URL = "https://api.bitget.com"
 
-# Optional: einfache Prüfung, dass alles geladen wurde
 if not all([BITGET_API_KEY, BITGET_API_SECRET, BITGET_PASSWORD]):
     raise ValueError("Bitget API credentials are missing in .env")
 
@@ -44,39 +45,44 @@ async def telegram_webhook(req: Request):
     
     return {"ok": True}
 
-def get_futures_balance(usdt=True):
-    url = BASE_URL + "/api/mix/v1/account/accounts"
-    # Auth Header je nach Bitget Docs nötig (hier nur symbolisch)
-    headers = {
-        "ACCESS-KEY": BITGET_API_KEY,
-        "ACCESS-SIGN": "...",
-        "ACCESS-TIMESTAMP": str(time.time()),
-        "ACCESS-PASSPHRASE": BITGET_PASSWORD
-    }
-    resp = requests.get(url, headers=headers)
-    data = resp.json()
-    # Beispiel: USDT Futures Konto
-    balance = 0
-    for account in data["data"]:
-        if account["currency"] == "USDT":
-            balance = float(account["available"])
-    return balance
+def get_current_price(symbol: str, product_type: str = "USDT-FUTURES") -> float:
+    url = f"{BASE_URL}/api/v2/mix/market/ticker"
+    params = {"symbol": symbol, "productType": product_type}
+    resp = requests.get(url, params=params, timeout=5)
 
-def get_current_price(symbol: str):
-    url = f"{BASE_URL}/api/mix/v1/market/ticker?symbol={symbol}"
-    resp = requests.get(url)
-    data = resp.json()
-    # z.B. letzter Preis
-    return float(data["data"]["last"])
+    if resp.status_code != 200:
+        raise Exception(f"Bitget API returned {resp.status_code}: {resp.text}")
 
-def calculate_position_size(balance: float, risk_percent: float, entry_price: float):
-    # X% vom Kontostand
-    risk_amount = balance * risk_percent / 100
-    # Positionsgröße = Risiko / Entry Preis
-    position_size = risk_amount / entry_price
-    return position_size
+    data = resp.json()
+    if data.get("code") != "00000":
+        raise Exception(f"API error: {data}")
+
+    try:
+        # data["data"] ist eine Liste → erstes Element auswählen
+        ticker_info = data["data"][0]
+        price = float(ticker_info["lastPr"])
+        print(f"[DEBUG] get_current_price: {symbol} = {price}")
+        return price
+    except (KeyError, TypeError, ValueError, IndexError):
+        raise Exception(f"Unexpected response: {data}")
+
+
+def get_position_size(symbol: str, usdt_budget: float = None, leverage: float = None, product_type: str = "USDT-FUTURES") -> float:
+    usdt_budget = usdt_budget or USDT_BUDGET
+    leverage = leverage or DEFAULT_LEVERAGE
+
+    price = get_current_price(symbol, product_type)
+    base_amount = (usdt_budget * leverage) / price
+    base_amount = round(base_amount, 6)
+
+    print(f"[DEBUG] get_position_size: symbol={symbol}, price={price}, usdt_budget={usdt_budget}, "
+          f"leverage={leverage}, calculated_size={base_amount}")
+    return base_amount
+
 
 def validate_trade(position_type, entry_price, stop_loss, take_profits, current_price):
+    if not take_profits:  # TP-Liste leer → Trade verwerfen
+        return False
     if position_type.upper() == "LONG":
         if current_price < stop_loss or current_price > max(take_profits):
             return False
@@ -94,41 +100,48 @@ def parse_signal(text: str):
         return None
     
     try:
+        clean_text = re.sub(r"\s+", " ", text.replace("\u00A0", " "))
         # PAIR
-        pair_match = re.search(r"PAIR:\s*(\w+/\w+)", text)
+        pair_match = re.search(r"PAIR:\s*(\w+/\w+)", clean_text)
         pair = pair_match.group(1) if pair_match else None
-        symbol = pair.replace("/", "") if pair else None  # Bitget Format
+        symbol = pair.replace("/", "").upper() if pair else None
 
         # TYPE
-        type_match = re.search(r"TYPE:\s*(LONG|SHORT)", text)
+        type_match = re.search(r"TYPE:\s*(LONG|SHORT)", clean_text)
         position_type = type_match.group(1) if type_match else None
 
         # ENTRY
-        entry_match = re.search(r"ENTRY:\s*([\d.]+)", text)
+        entry_match = re.search(r"ENTRY:\s*([\d.]+)", clean_text)
         entry_price = float(entry_match.group(1)) if entry_match else None
 
         # SL
-        sl_match = re.search(r"SL:\s*([\d.]+)", text)
+        sl_match = re.search(r"SL:\s*([\d.]+)", clean_text)
         stop_loss = float(sl_match.group(1)) if sl_match else None
 
         # TAKE PROFIT TARGETS
-        tp_matches = re.findall(r"TP\d+:\s*([\d.]+)", text)
-        take_profits = [float(tp) for tp in tp_matches] if tp_matches else []
+        tp_matches = re.findall(r"TP\d+:\s*([\d.]+)", clean_text)
+        take_profits = [float(tp) for tp in tp_matches if tp]
+        # Wenn TP-Liste leer ist → Trade ungültig
+        if not take_profits:
+            print("No valid TP found")
+            return None
 
         # LEVERAGE
-        lev_match = re.search(r"LEVERAGE:\s*x(\d+)", text)
+        lev_match = re.search(r"LEVERAGE:\s*x(\d+)", clean_text)
         leverage = int(lev_match.group(1)) if lev_match else None
+
+        print("DEBUG:", symbol, position_type, entry_price, stop_loss, take_profits, leverage)
 
 
         if not all([symbol, position_type, entry_price, stop_loss, leverage]):
             return None  # Pflichtfelder fehlen
         
-        balance = get_futures_balance()
-        position_size = calculate_position_size(balance, 2, entry_price)
         current_price = get_current_price(symbol)
-        
+        position_size = get_position_size(symbol, leverage=leverage)
+
+
         if not validate_trade(position_type, entry_price, stop_loss, take_profits, current_price):
-            print("Trade invalid due to current price vs SL/TP")
+            print(f"[DEBUG] Current={current_price}, SL={stop_loss}, TP_min={min(take_profits)}, TP_max={max(take_profits)}")
             return None        
         
         return {
