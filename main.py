@@ -16,7 +16,7 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 
 
 app = FastAPI()
-
+@app.get("/")
 # Lädt die .env Datei
 load_dotenv()
 
