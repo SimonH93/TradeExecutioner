@@ -16,9 +16,10 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(
 
 
 app = FastAPI()
-@app.get("/")
-# Lädt die .env Datei
 load_dotenv()
+@app.get("/")
+def read_root():
+    return {"status": "Service is running", "message": "OK - App initialized"}
 
 # Cache für Symbol-Informationen (Precision, Min Size, etc.)
 SYMBOL_INFO_CACHE = {} 
