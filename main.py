@@ -1,15 +1,16 @@
-from fastapi import FastAPI, Request
-import re
-import os
-from dotenv import load_dotenv
-import httpx 
-import asyncio 
-import time
-import hmac
-import hashlib
+import asyncio
 import base64
+import hashlib
+import hmac
 import json
-import logging 
+import logging
+import os
+import re
+import time
+
+import httpx
+from dotenv import load_dotenv
+from fastapi import FastAPI, Request
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
@@ -195,6 +196,54 @@ def sign_request(method, request_path, timestamp, body=""):
     h = hmac.new(BITGET_API_SECRET.encode(), message.encode(), hashlib.sha256)
     return base64.b64encode(h.digest()).decode()
 
+# Stellt den Hebel für das Handelspaar explizit ein
+async def set_leverage(symbol: str, leverage: int, margin_mode: str = "isolated"):
+    url_path = "/api/v2/mix/account/set-leverage"
+    url = f"{BASE_URL}{url_path}"
+    timestamp = str(int(time.time() * 1000))
+  
+    payload = {
+        "symbol": symbol,
+        "marginCoin": "USDT",
+        "leverage": str(leverage),
+        "marginMode": margin_mode,
+        "productType": "UMCBL",
+        "side": "whole" # Setzt Leverage für LONG und SHORT gleichzeitig
+    }
+    
+    body = json.dumps(payload)
+    signature = sign_request("POST", url_path, timestamp, body)
+
+    headers = {
+        "ACCESS-KEY": BITGET_API_KEY,
+        "ACCESS-SIGN": signature,
+        "ACCESS-TIMESTAMP": timestamp,
+        "ACCESS-PASSPHRASE": BITGET_PASSWORD,
+        "Content-Type": "application/json"
+    }
+    
+    try:
+        async with httpx.AsyncClient(timeout=5) as client:
+            resp = await client.post(url, headers=headers, data=body)
+            
+            if resp.status_code >= 400:
+                error_data = resp.json()
+                logging.error("[ERROR 4xx/5xx SET LEVERAGE] Status %d. Response Body: %s (Payload: %s)", 
+                              resp.status_code, error_data, payload)
+                return False
+
+            data = resp.json()
+            if data.get("code") != "00000":
+                logging.error("[ERROR] Bitget API response (Set Leverage failed): %s (Payload: %s)", data, payload)
+                return False
+            
+            logging.info(f"[SUCCESS] Leverage erfolgreich auf x{leverage} für {symbol} gesetzt.")
+            return True
+            
+    except httpx.RequestException as e:
+        logging.error("[ERROR] Set Leverage Request failed (network/timeout): %s", e)
+        return False
+
 async def place_market_order(symbol, size, side, leverage=10):
     url_path = "/api/mix/v1/order/placeOrder"
     url = f"{BASE_URL}{url_path}"
@@ -202,12 +251,12 @@ async def place_market_order(symbol, size, side, leverage=10):
 
     payload = {
         "symbol": symbol,
-        "size": size,
+        "size": str(size),
         "side": side,             # "buy" oder "sell"
         "orderType": "market",
         "marginMode": "isolated",  # isolierter Margin-Modus
         "productType": "UMCBL",
-        "leverage": leverage,
+        "leverage": str(leverage),
         "marginCoin": "USDT"
     }
     body = json.dumps(payload)
@@ -326,12 +375,18 @@ async def place_bitget_trade(signal, test_mode=True):
         market_side_open = "open_short"
         closing_side = "close_long"   # Schließt SHORT-Position
     
-
-    logging.info(f"[INFO] Platzieren Market Order: {market_side_open} {position_size} {symbol} (Leverage={leverage})")
-
     if test_mode:
         logging.info("[TEST MODE] Market Order, SL und TP Orders werden nicht gesendet")
         return
+
+    # Set explicit Leverage for pair
+    if leverage:
+        base_symbol_for_leverage = symbol.replace("_UMCBL", "")
+        leverage_set = await set_leverage(symbol=base_symbol_for_leverage, leverage=leverage, margin_mode="isolated")
+        if not leverage_set:
+            logging.error("Konnte Leverage nicht setzen. Trade wird abgebrochen.")
+            return
+
 
     # --- 1. Market Order platzieren ---
     market_order_resp = await place_market_order(symbol, position_size, side=market_side_open, leverage=leverage)
