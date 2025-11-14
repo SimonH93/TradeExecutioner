@@ -20,6 +20,9 @@ app = FastAPI()
 # Lädt die .env Datei
 load_dotenv()
 
+# Cache für Symbol-Informationen (Precision, Min Size, etc.)
+SYMBOL_INFO_CACHE = {} 
+
 # API Keys auslesen
 BITGET_API_KEY = os.getenv("BITGET_API_KEY")
 BITGET_API_SECRET = os.getenv("BITGET_API_SECRET")
@@ -85,25 +88,104 @@ async def get_current_price(symbol: str, product_type: str = "USDT-FUTURES") -> 
         logging.error("Unexpected response structure: %s - Error: %s", data, e)
         raise Exception(f"Unexpected response: {data}")
 
+async def get_symbol_metadata(base_symbol: str) -> int:
+    global SYMBOL_INFO_CACHE
+    
+    if base_symbol in SYMBOL_INFO_CACHE:
+        return SYMBOL_INFO_CACHE[base_symbol]
+
+    url = f"{BASE_URL}/api/v3/market/instruments" 
+    params = {"category": "USDT-FUTURES"} # USDT-M Contracts
+
+    fallback = {"sizeScale": 4, "priceScale": 4} 
+
+    try:
+        async with httpx.AsyncClient(timeout=5) as client:
+            resp = await client.get(url, params=params)
+            resp.raise_for_status() 
+            data = resp.json()
+
+        if data.get("code") != "00000":
+            logging.error("API error (get_symbol_precision): %s", data)
+            return 4 # Fallback
+            
+        for symbol_info in data["data"]:
+            symbol = symbol_info["symbol"]
+            if not symbol: continue
+            if symbol == base_symbol: 
+                size_scale_raw = symbol_info.get("quantityPrecision")
+                price_scale_raw = symbol_info.get("pricePrecision")
+                
+                if size_scale_raw is None or price_scale_raw is None:
+                    logging.warning("Precision (quantityPrecision or pricePrecision) not found for %s. Defaulting to 4/4.", base_symbol)
+                    return fallback
+                size_scale = int(size_scale_raw)
+                price_scale = int(price_scale_raw)
+                
+                metadata = {
+                    "sizeScale": size_scale,
+                    "priceScale": price_scale
+                }
+
+                SYMBOL_INFO_CACHE[base_symbol] = metadata
+                logging.info("[DEBUG] Fetched metadata for %s: quantityPrecision=%d, pricePrecision=%d", 
+                             base_symbol, size_scale, price_scale)
+                return metadata
+        logging.warning("Metadata not found for symbol %s in market instruments list. Defaulting to 4/4.", base_symbol)
+        return fallback
+        
+    except Exception as e:
+        logging.error("Error fetching symbol precision: %s", e)
+        return 4 # Fallback bei Fehler
+
+async def get_quantity_scale(base_symbol: str) -> int:
+    """Gibt die Präzision für die Positionsgröße zurück."""
+    metadata = await get_symbol_metadata(base_symbol)
+    return metadata.get("sizeScale", 4)
+
+async def get_price_scale(base_symbol: str) -> int:
+    """Gibt die Präzision für den Preis zurück."""
+    metadata = await get_symbol_metadata(base_symbol)
+    return metadata.get("priceScale", 4)
+
 
 async def get_position_size(base_symbol: str, usdt_budget: float = None, leverage: float = None, product_type: str = "USDT-FUTURES"):
     usdt_budget = usdt_budget or USDT_BUDGET
     leverage = leverage or DEFAULT_LEVERAGE
 
+    size_scale = await get_quantity_scale(base_symbol)
+    
     # Aktueller Preis
     price = await get_current_price(base_symbol, product_type)
-    total_size = (usdt_budget * leverage) / price
-    total_size = round(total_size, 4)
+    total_size_raw = (usdt_budget * leverage) / price
+    total_size = round(total_size_raw, size_scale)
 
-    # Teilpositionen für Take-Profit
-    tp_sizes = [
-        round(total_size * 0.5, 4),  # TP1 = 50%
-        round(total_size * 0.3, 4),  # TP2 = 30%
+    tp_sizes_raw = [
+        total_size_raw * 0.5,  # TP1 = 50%
+        total_size_raw * 0.3,  # TP2 = 30%
     ]
-    tp_sizes.append(round(total_size - sum(tp_sizes), 4))  # Rest in TP3
+    
+    tp_sizes = [round(s, size_scale) for s in tp_sizes_raw]
 
-    print(f"[DEBUG] get_position_size: symbol={base_symbol}, price={price}, usdt_budget={usdt_budget}, "
-          f"leverage={leverage}, total_size={total_size}, tp_sizes={tp_sizes}")
+    tp3_size_raw = total_size - sum(tp_sizes)
+    tp3_size = round(tp3_size_raw, size_scale) # Stelle sicher, dass TP3 ebenfalls korrekt gerundet ist
+
+    # Füge TP3 hinzu, aber nur wenn es größer als 0 ist
+    if tp3_size > 0:
+        tp_sizes.append(tp3_size)
+    else:
+        # Falls TP3 zu klein ist, verteilen wir den Rest auf TP2 (oder TP1)
+        if len(tp_sizes) >= 2:
+            tp_sizes[-1] = round(tp_sizes[-1] + tp3_size_raw, size_scale)
+        elif len(tp_sizes) == 1:
+            tp_sizes[0] = round(tp_sizes[0] + tp3_size_raw, size_scale)
+    
+
+    # Final prüfen, ob die Gesamtgröße durch die Rundung auf 0 gefallen ist (Minimale Größe)
+    if total_size <= 0 and total_size_raw > 0:
+         logging.warning("Calculated position size %f was rounded down to 0 or below due to precision or minimum size.", total_size_raw)
+
+    print(f"[DEBUG] get_position_size: symbol={base_symbol}, price={price}, sizeScale={size_scale}, total_size={total_size}, tp_sizes={tp_sizes}")
     
     return total_size, tp_sizes
 
@@ -304,6 +386,13 @@ async def place_conditional_order(symbol, size, trigger_price, side: str, is_sl:
         logging.error("Ungültiger Side für Conditional Order: %s. Erwarte 'close_long' oder 'close_short'.", side)
         return None
 
+    base_symbol = symbol.replace("_UMCBL", "")
+    price_scale = await get_price_scale(base_symbol)
+    rounded_price = round(trigger_price, price_scale)
+    
+    logging.info(f"[DEBUG] Applying price rounding: Original={trigger_price}, Scale={price_scale}, Rounded={rounded_price}")
+
+
     # SL soll Market sein, TP soll Limit sein
     order_type = "market" if is_sl else "limit"
     
@@ -314,13 +403,13 @@ async def place_conditional_order(symbol, size, trigger_price, side: str, is_sl:
         "orderType": order_type,
         "productType": "UMCBL",
         "marginCoin": "USDT",
-        "triggerPrice": str(trigger_price), # Trigger-Preis
+        "triggerPrice": str(rounded_price),
         "triggerType": "mark_price"
     }
     if is_sl:
         payload["entrustPrice"] = "0"
     else:
-        payload["executePrice"] = str(trigger_price)
+        payload["executePrice"] = str(rounded_price)
     
     body = json.dumps(payload)
     signature = sign_request("POST", url_path, timestamp, body)
