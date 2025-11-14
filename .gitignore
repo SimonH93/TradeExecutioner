@@ -1,8 +1,17 @@
 # Python virtual environments
-.venv/
 venv/
+env/
+.venv/
+.env/
+.env
 
 # Logs & temporary files
 *.log
 *.tmp
 *.env
+*.pyc
+*.log
+
+pycache/
+
+*.code-workspace
