@@ -520,7 +520,18 @@ async def place_conditional_order(symbol, size, trigger_price, side: str, is_sl:
 
     # SL soll Market sein, TP soll Limit sein
     order_type = "market" if is_sl else "limit"
-    
+    if is_sl:
+        # SL muss Market sein, damit er garantiert ausgeführt wird.
+        order_type = "market" 
+        entrust_price = "0" # Oder weglassen, aber 0 ist sicherer
+        logging.info("[DEBUG] Conditional Order: Setting SL as Market Order.")
+    else:
+        # TP ist eine Limit Order mit dem TP-Preis als Limit-Preis
+        order_type = "limit"
+        entrust_price = str(rounded_price) # Der Preis, zu dem ausgeführt werden soll (Limit-Preis)
+        logging.info("[DEBUG] Conditional Order: Setting TP as Limit Order.")
+
+
     payload = {
         "symbol": symbol,
         "size": str(size),
@@ -529,12 +540,9 @@ async def place_conditional_order(symbol, size, trigger_price, side: str, is_sl:
         "productType": "UMCBL",
         "marginCoin": "USDT",
         "triggerPrice": str(rounded_price),
-        "triggerType": "mark_price"
+        "triggerType": "mark_price",
+        "entrustPrice": entrust_price
     }
-    if is_sl:
-        payload["entrustPrice"] = "0"
-    else:
-        payload["executePrice"] = str(rounded_price)
     
     body = json.dumps(payload)
     signature = sign_request("POST", url_path, timestamp, body)
