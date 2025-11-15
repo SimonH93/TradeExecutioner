@@ -12,6 +12,9 @@ env/
 *.pyc
 *.log
 
+bot_session.session
+session_base64.txt
+
 pycache/
 
 *.code-workspace

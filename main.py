@@ -9,17 +9,84 @@ import re
 import time
 
 import httpx
+import uvicorn
+from telethon import TelegramClient, events
 from dotenv import load_dotenv
 from fastapi import FastAPI, Request
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
-
 app = FastAPI()
-load_dotenv()
+
 @app.get("/")
 def read_root():
-    return {"status": "Service is running", "message": "OK - App initialized"}
+    """Zeigt den Status an. Wird von Railway für den Health Check benötigt."""
+    return {"status": "Service is running", "message": "OK - User Client is listening in background."}
+
+
+load_dotenv()
+# --- Telethon Config ---
+API_ID = os.getenv("TELEGRAM_API_ID")
+API_HASH = os.getenv("TELEGRAM_API_HASH")
+SESSION_NAME = os.getenv("TELEGRAM_SESSION_FILE", "bot_session") # Benötigt, um sich nicht ständig neu anzumelden
+SESSION_PARTS = []
+# Durchsuche alle Umgebungsvariablen
+for key, value in os.environ.items():
+    # Prüfe auf das Präfix und stelle sicher, dass der Wert nicht leer ist
+    if key.startswith("TELEGRAM_SESSION_PART") and value:
+        try:
+            # Extrahiere die Part-Nummer (z.B. '1' aus 'TELEGRAM_SESSION_PART1')
+            part_number_str = key.replace("TELEGRAM_SESSION_PART", "")
+            part_number = int(part_number_str)
+            SESSION_PARTS.append((part_number, value))
+        except ValueError:
+            # Ignoriere Schlüssel, die nicht mit einer Zahl enden
+            continue 
+
+# Sortiere nach der Part-Nummer (1, 2, 3...)
+SESSION_PARTS.sort(key=lambda x: x[0])
+SESSION_BASE64 = "".join([part[1] for part in SESSION_PARTS])
+
+if SESSION_BASE64:
+    logging.info("Telethon Session Content gefunden und aus %d Teilen zusammengesetzt.", len(SESSION_PARTS))
+else:
+    logging.warning("Kein TELEGRAM_SESSION_PART... Umgebungsvariable gefunden.")
+
+SOURCE_CHANNELS_RAW = os.getenv("TELEGRAM_SOURCE_CHANNELS", "")
+if not SOURCE_CHANNELS_RAW:
+    logging.error("TELEGRAM_SOURCE_CHANNELS Umgebungsvariable fehlt!")
+
+SOURCE_FILTERS = set()
+SOURCE_CHANNELS = set()
+
+for item in SOURCE_CHANNELS_RAW.split(','):
+    item = item.strip()
+    if not item: continue
+    
+    # Der item kann entweder nur die Chat ID sein oder Chat ID:Thread ID
+    parts = item.split(':')
+    
+    try:
+        chat_id_raw = parts[0]
+        # Füge die Haupt-ID zur Filter-Set hinzu (für Nachrichten ohne Thread)
+        SOURCE_FILTERS.add(chat_id_raw)
+        
+        # Füge die Haupt-ID zur Telethon-Event-Liste hinzu (muss ein Integer sein, wenn negativ)
+        chat_id = int(chat_id_raw) if chat_id_raw.startswith('-') else chat_id_raw
+        SOURCE_CHANNELS.add(chat_id)
+        
+        # Wenn eine Thread-ID vorhanden ist, füge die Kombination ebenfalls zur Filter-Set hinzu
+        if len(parts) > 1:
+            thread_id = parts[1]
+            if thread_id:
+                SOURCE_FILTERS.add(f"{chat_id_raw}:{thread_id}")
+
+    except ValueError:
+        logging.warning("Ungültiges Format in TELEGRAM_SOURCE_CHANNELS gefunden: %s. Ignoriere.", item)
+
+if not SOURCE_CHANNELS and SOURCE_CHANNELS_RAW:
+    logging.warning("Keine gültigen Kanal-IDs in TELEGRAM_SOURCE_CHANNELS gefunden.")
+
 
 # Cache für Symbol-Informationen (Precision, Min Size, etc.)
 SYMBOL_INFO_CACHE = {} 
@@ -37,34 +104,91 @@ TEST_MODE = os.getenv("BITGET_TEST_MODE", "True").lower() == "true"
 # Base URL für Bitget Futures
 BASE_URL = "https://api.bitget.com"
 
-if not all([BITGET_API_KEY, BITGET_API_SECRET, BITGET_PASSWORD]):
-    raise ValueError("Bitget API credentials are missing in .env")
+if not all([BITGET_API_KEY, BITGET_API_SECRET, BITGET_PASSWORD, API_ID, API_HASH]):
+    raise ValueError("Mindestens ein benötigtes API Credential (Bitget oder Telegram) fehlt in .env")
 
+async def run_client():
+    if SESSION_BASE64:
+        session_filepath = f"{SESSION_NAME}.session"
+    try:
+        # Den Base64-String in binäre Daten dekodieren
+        session_data = base64.b64decode(SESSION_BASE64)
+        # Die .session-Datei im Container speichern
+        with open(session_filepath, 'wb') as f:
+            f.write(session_data)
+        logging.info("Telethon Session erfolgreich aus Base64 dekodiert und als Datei gespeichert.")
+    except Exception as e:
+        logging.error("Fehler beim Dekodieren oder Speichern der Session-Datei: %s", e)
+        # Bei Fehler den Start abbrechen oder versuchen, neu zu autorisieren (was hier nicht implementiert ist)
+        return
 
-# Beispiel: Telegram Webhook Endpoint
-@app.post("/telegram_webhook")
-async def telegram_webhook(req: Request):
-    try: 
-        data = await req.json()  # Telegram Update
-        message_text = data.get("message", {}).get("text", "")
+    # client wird als 'user' initialisiert (phone=None, da die Session-Datei später geladen wird)
+    client = TelegramClient(SESSION_NAME, API_ID, API_HASH)
+
+    try:
+        await client.start()
         
+        # Wichtig: Die erste Anmeldung erfordert die Eingabe des Codes im Terminal.
+        # Da Railway kein interaktives Terminal hat, MÜSSEN Sie sich lokal anmelden,
+        # damit die Session-Datei (bot_session.session) erstellt wird, 
+        # und diese Datei dann zu Ihrem Deployment hinzufügen.
+        # Ohne Session-Datei wird der Start auf Railway fehlschlagen!
+        logging.info("Telethon Client gestartet.")
+
+        # Nachricht an den Admin senden, dass der Bot erfolgreich gestartet wurde
+        # (Optional, aber hilfreich für die Diagnose)
+        
+    except Exception as e:
+        logging.error("Fehler beim Starten des Telethon-Clients: %s", e)
+        return
+
+    # Registriert den Handler für neue Nachrichten
+    # Hier filtern wir nur Nachrichten aus den definierten Source Channels
+    @client.on(events.NewMessage(chats=list(SOURCE_CHANNELS)))
+    async def handler(event):
+        """Verarbeitet jede neue Nachricht aus den überwachten Channels."""
+        message_text = event.message.message
+        
+        logging.debug(f"Event received for Chat ID: {event.chat_id} (Type: {type(event.chat_id)}), Message: {message_text[:30]}...")
+        
+        # Ignoriere leere Nachrichten oder solche, die nur Bilder sind
         if not message_text:
-            return {"ok": True}  # leere Nachricht ignorieren
+             return
         
-        # Parsing der Nachricht
+        chat_id_str = str(event.chat_id)
+        thread_id = getattr(event.message, 'reply_to_top_id', None)
+        filter_key = chat_id_str
+        if thread_id:
+            # Wenn es einen Thread gibt, verwenden wir die Kombination
+            filter_key = f"{chat_id_str}:{thread_id}"
+            
+        if filter_key not in SOURCE_FILTERS:
+            logging.debug("Nachricht von nicht autorisiertem Thread/Chat %s empfangen. Ignoriere.", filter_key)
+            return
+            
+        logging.info(f"Nachricht von autorisiertem Chat/Thread {filter_key} empfangen: {message_text[:50]}...")
+
+        # Die gesamte Logik des Webhooks wird hierher verschoben
         signal = await parse_signal(message_text)
         
         if signal:
-            print("Signal erkannt:", signal)
+            logging.info("Signal erkannt: %s", signal)
             await place_bitget_trade(signal, test_mode=TEST_MODE)
         else:
-            print("Keine valide Nachricht")
-        
-    except Exception as e:
-        # Protokolliert den Fehler ausführlich und verhindert das Looping
-        logging.error("FATAL UNHANDLED EXCEPTION DURING WEBHOOK PROCESSING! Loop averted.", exc_info=True)
+            logging.debug("Kein valides Handelssignal in der Nachricht.")
 
-    return {"ok": True}
+
+    # Halte den Client am Laufen, bis er manuell beendet wird
+    await client.run_until_disconnected()
+
+
+# --- START THE APPLICATION ---
+
+@app.on_event("startup")
+async def startup_event():
+    # Startet den Client-Task, blockiert aber nicht den FastAPI-Server
+    asyncio.create_task(run_client())
+
 
 async def get_current_price(symbol: str, product_type: str = "USDT-FUTURES") -> float:
     url = f"{BASE_URL}/api/v2/mix/market/ticker"
@@ -514,3 +638,7 @@ async def place_bitget_trade(signal, test_mode=True):
         logging.info(f"TP{i+1} Plan Order (Price: {tp_price}, Size: {tp_size}) Response: %s", tp_resp)
         
     logging.info("[INFO] Alle Orders (Market, SL, 3xTP) wurden gesendet.")
+
+
+if __name__ == "__main__":
+    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
