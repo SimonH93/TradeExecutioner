@@ -28,22 +28,23 @@ load_dotenv()
 # --- Telethon Config ---
 API_ID = os.getenv("TELEGRAM_API_ID")
 API_HASH = os.getenv("TELEGRAM_API_HASH")
-SESSION_NAME = os.getenv("TELEGRAM_SESSION_FILE", "bot_session") # Benötigt, um sich nicht ständig neu anzumelden
+SESSION_NAME = os.getenv("TELEGRAM_SESSION_FILE", "bot_session") 
 SESSION_PARTS = []
-# Durchsuche alle Umgebungsvariablen
+
+# Search all environment variables
 for key, value in os.environ.items():
-    # Prüfe auf das Präfix und stelle sicher, dass der Wert nicht leer ist
+    # Check for prefix and ensure value is not empty
     if key.startswith("TELEGRAM_SESSION_PART") and value:
         try:
-            # Extrahiere die Part-Nummer (z.B. '1' aus 'TELEGRAM_SESSION_PART1')
+            # # Extract the part number (e.g. '1' from 'TELEGRAM_SESSION_PART1')
             part_number_str = key.replace("TELEGRAM_SESSION_PART", "")
             part_number = int(part_number_str)
             SESSION_PARTS.append((part_number, value))
         except ValueError:
-            # Ignoriere Schlüssel, die nicht mit einer Zahl enden
+            # Ignore keys not ending with a number
             continue 
 
-# Sortiere nach der Part-Nummer (1, 2, 3...)
+# Sort by part number (1, 2, 3...)
 SESSION_PARTS.sort(key=lambda x: x[0])
 SESSION_BASE64 = "".join([part[1] for part in SESSION_PARTS])
 
@@ -63,19 +64,19 @@ for item in SOURCE_CHANNELS_RAW.split(','):
     item = item.strip()
     if not item: continue
     
-    # Der item kann entweder nur die Chat ID sein oder Chat ID:Thread ID
+    # Item can be either just the chat ID or Chat ID:Thread ID
     parts = item.split(':')
     
     try:
         chat_id_raw = parts[0]
-        # Füge die Haupt-ID zur Filter-Set hinzu (für Nachrichten ohne Thread)
+        # Add the main ID to the filter set (for messages without a thread)
         SOURCE_FILTERS.add(chat_id_raw)
         
-        # Füge die Haupt-ID zur Telethon-Event-Liste hinzu (muss ein Integer sein, wenn negativ)
+        # Add the main ID to the Telethon event list (must be an integer if negative)
         chat_id = int(chat_id_raw) if chat_id_raw.startswith('-') else chat_id_raw
         SOURCE_CHANNELS.add(chat_id)
         
-        # Wenn eine Thread-ID vorhanden ist, füge die Kombination ebenfalls zur Filter-Set hinzu
+        # If a thread ID is present, also add the combination to the filter set
         if len(parts) > 1:
             thread_id = parts[1]
             if thread_id:
@@ -88,10 +89,10 @@ if not SOURCE_CHANNELS and SOURCE_CHANNELS_RAW:
     logging.warning("Keine gültigen Kanal-IDs in TELEGRAM_SOURCE_CHANNELS gefunden.")
 
 
-# Cache für Symbol-Informationen (Precision, Min Size, etc.)
+# Cache for symbol information (Precision, Min Size, etc.)
 SYMBOL_INFO_CACHE = {} 
 
-# API Keys auslesen
+# Read API Keys
 BITGET_API_KEY = os.getenv("BITGET_API_KEY")
 BITGET_API_SECRET = os.getenv("BITGET_API_SECRET")
 BITGET_PASSWORD = os.getenv("BITGET_PASSWORD")
@@ -101,7 +102,7 @@ DEFAULT_LEVERAGE = float(os.getenv("BITGET_LEVERAGE", 1))
 TEST_MODE = os.getenv("BITGET_TEST_MODE", "True").lower() == "true"
 
 
-# Base URL für Bitget Futures
+# Base URL for Bitget Futures
 BASE_URL = "https://api.bitget.com"
 
 if not all([BITGET_API_KEY, BITGET_API_SECRET, BITGET_PASSWORD, API_ID, API_HASH]):
@@ -111,47 +112,41 @@ async def run_client():
     if SESSION_BASE64:
         session_filepath = f"{SESSION_NAME}.session"
     try:
-        # Den Base64-String in binäre Daten dekodieren
+        # Decode the Base64 string into binary data
         session_data = base64.b64decode(SESSION_BASE64)
-        # Die .session-Datei im Container speichern
+        # Save the .session file in the container
         with open(session_filepath, 'wb') as f:
             f.write(session_data)
         logging.info("Telethon Session erfolgreich aus Base64 dekodiert und als Datei gespeichert.")
     except Exception as e:
         logging.error("Fehler beim Dekodieren oder Speichern der Session-Datei: %s", e)
-        # Bei Fehler den Start abbrechen oder versuchen, neu zu autorisieren (was hier nicht implementiert ist)
         return
 
-    # client wird als 'user' initialisiert (phone=None, da die Session-Datei später geladen wird)
+    # client is initialized as 'user' (phone=None, as the session file will be loaded later)
     client = TelegramClient(SESSION_NAME, API_ID, API_HASH)
 
     try:
         await client.start()
         
-        # Wichtig: Die erste Anmeldung erfordert die Eingabe des Codes im Terminal.
-        # Da Railway kein interaktives Terminal hat, MÜSSEN Sie sich lokal anmelden,
-        # damit die Session-Datei (bot_session.session) erstellt wird, 
-        # und diese Datei dann zu Ihrem Deployment hinzufügen.
-        # Ohne Session-Datei wird der Start auf Railway fehlschlagen!
+        # IMPORTANT: Initial login requires code entry in a terminal.
+        # Since Railway is non-interactive, you MUST log in locally first 
+        # to generate the session file (bot_session.session), 
+        # and then provide it via the TELEGRAM_SESSION_PART environment variables.
         logging.info("Telethon Client gestartet.")
-
-        # Nachricht an den Admin senden, dass der Bot erfolgreich gestartet wurde
-        # (Optional, aber hilfreich für die Diagnose)
         
     except Exception as e:
         logging.error("Fehler beim Starten des Telethon-Clients: %s", e)
         return
 
-    # Registriert den Handler für neue Nachrichten
-    # Hier filtern wir nur Nachrichten aus den definierten Source Channels
+    # Register the new message handler, filtering only messages from defined Source Channels
     @client.on(events.NewMessage(chats=list(SOURCE_CHANNELS)))
     async def handler(event):
-        """Verarbeitet jede neue Nachricht aus den überwachten Channels."""
+        """Processes every new message from the monitored channels."""
         message_text = event.message.message
         
         logging.debug(f"Event received for Chat ID: {event.chat_id} (Type: {type(event.chat_id)}), Message: {message_text[:30]}...")
         
-        # Ignoriere leere Nachrichten oder solche, die nur Bilder sind
+        # Ignore empty messages or those that are only pictures
         if not message_text:
              return
         
@@ -159,7 +154,6 @@ async def run_client():
         thread_id = getattr(event.message, 'reply_to_top_id', None)
         filter_key = chat_id_str
         if thread_id:
-            # Wenn es einen Thread gibt, verwenden wir die Kombination
             filter_key = f"{chat_id_str}:{thread_id}"
             
         if filter_key not in SOURCE_FILTERS:
@@ -168,7 +162,7 @@ async def run_client():
             
         logging.info(f"Nachricht von autorisiertem Chat/Thread {filter_key} empfangen: {message_text[:50]}...")
 
-        # Die gesamte Logik des Webhooks wird hierher verschoben
+        # The core webhook logic is here
         signal = await parse_signal(message_text)
         
         if signal:
@@ -178,7 +172,7 @@ async def run_client():
             logging.debug("Kein valides Handelssignal in der Nachricht.")
 
 
-    # Halte den Client am Laufen, bis er manuell beendet wird
+    # Keep the client running until disconnected
     await client.run_until_disconnected()
 
 
@@ -186,7 +180,7 @@ async def run_client():
 
 @app.on_event("startup")
 async def startup_event():
-    # Startet den Client-Task, blockiert aber nicht den FastAPI-Server
+    # Start the client task without blocking the FastAPI server
     asyncio.create_task(run_client())
 
 
@@ -220,7 +214,7 @@ async def get_symbol_metadata(base_symbol: str) -> dict:
         return SYMBOL_INFO_CACHE[base_symbol]
 
     url = f"{BASE_URL}/api/v3/market/instruments" 
-    params = {"category": "USDT-FUTURES"} # USDT-M Contracts
+    params = {"category": "USDT-FUTURES"}
 
     fallback = {
         "sizeScale": 4, 
@@ -278,7 +272,7 @@ async def get_symbol_metadata(base_symbol: str) -> dict:
         
     except Exception as e:
         logging.error("Error fetching symbol precision: %s", e)
-        return 4 # Fallback bei Fehler
+        return 4 # Fallback for errors
 
 async def get_quantity_scale(base_symbol: str) -> int:
     """Gibt die Präzision für die Positionsgröße zurück."""
@@ -299,7 +293,7 @@ async def get_position_size(base_symbol: str, usdt_budget: float = None, leverag
     max_market_qty = metadata.get("maxMarketQty")
     max_limit_qty = metadata.get("maxLimitQty")
     
-    # Aktueller Preis
+    # Current Price
     price = await get_current_price(base_symbol, product_type)
     total_size_raw_desired = (usdt_budget * leverage) / price
     
@@ -319,14 +313,13 @@ async def get_position_size(base_symbol: str, usdt_budget: float = None, leverag
         total_size * 0.3,  # TP2 = 30%
     ]
     tp_sizes = [round(s, size_scale) for s in tp_sizes_raw_splits]
-    # Berechnung des Rests (TP3)
+
     tp3_size_raw = total_size - sum(tp_sizes)
     tp3_size = round(tp3_size_raw, size_scale)
 
     if tp3_size > 0:
         tp_sizes.append(tp3_size)
     else:
-        # Falls TP3 zu klein ist, den Rest auf den letzten gültigen TP aufschlagen
         if len(tp_sizes) > 0:
             tp_sizes[-1] = round(tp_sizes[-1] + tp3_size_raw, size_scale)
     
@@ -338,7 +331,7 @@ async def get_position_size(base_symbol: str, usdt_budget: float = None, leverag
 
 
 def validate_trade(position_type, stop_loss, take_profits, current_price):
-    if not take_profits:  # TP-Liste leer → Trade verwerfen
+    if not take_profits:
         return False
     if position_type.upper() == "LONG":
         if current_price < stop_loss or current_price > max(take_profits):
@@ -349,7 +342,7 @@ def validate_trade(position_type, stop_loss, take_profits, current_price):
     return True
 
 
-# Parser für dein Signalformat
+# Parser for the signal format
 async def parse_signal(text: str):
     
     if "POSITION SIZE" not in text.upper():  # case-insensitive check
@@ -379,7 +372,7 @@ async def parse_signal(text: str):
         # TAKE PROFIT TARGETS
         tp_matches = re.findall(r"TP\d+:\s*([\d.]+)", clean_text)
         take_profits = [float(tp) for tp in tp_matches if tp]
-        # Wenn TP-Liste leer ist → Trade ungültig
+        # If TP list is empty, reject trade
         if not take_profits:
             print("No valid TP found")
             return None
@@ -392,10 +385,10 @@ async def parse_signal(text: str):
 
 
         if not all([base_symbol, position_type, entry_price, stop_loss, leverage]):
-            return None  # Pflichtfelder fehlen
+            return None  # Required fields missing
         
         current_price = await get_current_price(base_symbol)
-        # Position berechnen + TP-Aufteilung
+        # Calculate position + TP split
         position_size, tp_sizes = await get_position_size(base_symbol, leverage=leverage)
         print(f"[DEBUG] Total position size: {position_size}, TP split sizes: {tp_sizes}")
 
@@ -424,7 +417,7 @@ def sign_request(method, request_path, timestamp, body=""):
     h = hmac.new(BITGET_API_SECRET.encode(), message.encode(), hashlib.sha256)
     return base64.b64encode(h.digest()).decode()
 
-# Stellt den Hebel für das Handelspaar explizit ein
+# Explicitly sets the leverage for the trading pair
 async def set_leverage(symbol: str, leverage: int, margin_mode: str = "isolated"):
     url_path = "/api/v2/mix/account/set-leverage"
     url = f"{BASE_URL}{url_path}"
@@ -436,7 +429,7 @@ async def set_leverage(symbol: str, leverage: int, margin_mode: str = "isolated"
         "leverage": str(leverage),
         "marginMode": margin_mode,
         "productType": "UMCBL",
-        "side": "whole" # Setzt Leverage für LONG und SHORT gleichzeitig
+        "side": "whole" # Sets leverage for LONG and SHORT simultaneously
     }
     
     body = json.dumps(payload)
@@ -482,7 +475,7 @@ async def place_market_order(symbol, size, side, leverage=10):
         "size": str(size),
         "side": side,             # "buy" oder "sell"
         "orderType": "market",
-        "marginMode": "isolated",  # isolierter Margin-Modus
+        "marginMode": "isolated",  # Isolated margin mode
         "productType": "UMCBL",
         "leverage": str(leverage),
         "marginCoin": "USDT"
@@ -499,7 +492,7 @@ async def place_market_order(symbol, size, side, leverage=10):
     }
 
     try:
-         # Verwende httpx.AsyncClient für nicht-blockierende Anfragen
+         # Use httpx.AsyncClient for non-blocking requests
         async with httpx.AsyncClient(timeout=5) as client:
             resp = await client.post(url, headers=headers, data=body)
         
@@ -519,7 +512,7 @@ async def place_market_order(symbol, size, side, leverage=10):
             return None
         return data
     except httpx.RequestException as e:
-        # Fängt Netzwerkfehler oder Timeouts
+        # Catches network errors or timeouts
         logging.error("[ERROR] Market Order Request failed (network/timeout): %s", e)
         return None
 
@@ -539,17 +532,17 @@ async def place_conditional_order(symbol, size, trigger_price, side: str, is_sl:
     logging.info(f"[DEBUG] Applying price rounding: Original={trigger_price}, Scale={price_scale}, Rounded={rounded_price}")
 
 
-    # SL soll Market sein, TP soll Limit sein
+    # SL should be Market, TP should be Limit
     order_type = "market" if is_sl else "limit"
     if is_sl:
-        # SL muss Market sein, damit er garantiert ausgeführt wird.
+        # SL must be a Market order to ensure execution.
         order_type = "market" 
-        entrust_price = "0" # Oder weglassen, aber 0 ist sicherer
+        entrust_price = "0" # Or omit, but 0 is safer
         logging.info("[DEBUG] Conditional Order: Setting SL as Market Order.")
     else:
-        # TP ist eine Limit Order mit dem TP-Preis als Limit-Preis
+        # TP is a Limit Order with the TP price as the limit price
         order_type = "limit"
-        entrust_price = str(rounded_price) # Der Preis, zu dem ausgeführt werden soll (Limit-Preis)
+        entrust_price = str(rounded_price) # DThe price at which the order should be executed (limit price)
         logging.info("[DEBUG] Conditional Order: Setting TP as Limit Order.")
 
 
@@ -580,7 +573,6 @@ async def place_conditional_order(symbol, size, trigger_price, side: str, is_sl:
         async with httpx.AsyncClient(timeout=5) as client:
             resp = await client.post(url, headers=headers, data=body)
             
-            # <<< GEÄNDERT: Manuelles Handling, um Crash zu verhindern. Protokolliert den Bitget Fehler-Body.
             if resp.status_code >= 400:
                 try:
                     error_data = resp.json()
@@ -589,10 +581,9 @@ async def place_conditional_order(symbol, size, trigger_price, side: str, is_sl:
                 except json.JSONDecodeError:
                     logging.error("[ERROR 4xx/5xx CONDITIONAL ORDER] Bitget API Status Code %d. Response Text: %s (Payload: %s)", 
                                   resp.status_code, resp.text, payload)
-                return None  # Hält den Aufruf an place_bitget_trade() an der Absturzstelle
-            # <<< ENDE ÄNDERUNG
+                return None
 
-            # Jetzt Status 200/300
+            # Status 200/300
             data = resp.json()
             if data.get("code") != "00000":
                 logging.error("[ERROR] Bitget Conditional Plan Order API response (Status 200, but Code != 00000): %s (Payload: %s)", data, payload)
@@ -613,10 +604,10 @@ async def place_bitget_trade(signal, test_mode=True):
 
     if signal["type"].upper() == "LONG":
         market_side_open = "open_long"
-        closing_side = "close_short"  # Schließt LONG-Position
+        closing_side = "close_short"  # Closes LONG position
     else: # SHORT
         market_side_open = "open_short"
-        closing_side = "close_long"   # Schließt SHORT-Position
+        closing_side = "close_long"   # Closes SHORT position
     
     if test_mode:
         logging.info("[TEST MODE] Market Order, SL und TP Orders werden nicht gesendet")
@@ -631,7 +622,7 @@ async def place_bitget_trade(signal, test_mode=True):
             return
 
 
-    # --- 1. Market Order platzieren ---
+    # --- 1. Place Market Order ---
     market_order_resp = await place_market_order(symbol, position_size, side=market_side_open, leverage=leverage)
     logging.info("Market Order Response: %s", market_order_resp)
 
@@ -639,7 +630,7 @@ async def place_bitget_trade(signal, test_mode=True):
         logging.error("Konnte Market Order nicht platzieren. SL/TP Orders werden abgebrochen.")
         return
     
-    # Warten bis Order ausgeführt
+    # Wait for order execution
     logging.info("[INFO] Warte 3.0 Sekunden (nicht-blockierend) zur Sicherheit.")
     await asyncio.sleep(3.0)
 
@@ -649,7 +640,7 @@ async def place_bitget_trade(signal, test_mode=True):
         size=position_size, 
         trigger_price=sl_price,
         side=closing_side,
-        is_sl=True # Kennzeichnet SL -> orderType="market"
+        is_sl=True # Marks as SL -> orderType="market"
     )
     logging.info("Stop-Loss Plan Order Response: %s", sl_resp)
 
@@ -662,7 +653,7 @@ async def place_bitget_trade(signal, test_mode=True):
             size=tp_size,
             trigger_price=tp_price,
             side=closing_side,
-            is_sl=False # Kennzeichnet TP -> orderType="limit"
+            is_sl=False # Marks as TP -> orderType="limit"
         )
         logging.info(f"TP{i+1} Plan Order (Price: {tp_price}, Size: {tp_size}) Response: %s", tp_resp)
         
