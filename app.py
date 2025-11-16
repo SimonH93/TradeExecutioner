@@ -1,13 +1,14 @@
 from fastapi import FastAPI
 import uvicorn
 import logging
+import os
 
 # Konfigurieren des Loggings
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # Initialisierung der FastAPI-App
-app = FastAPI(title="Meine Beispiel-App")
+app = FastAPI(title="TradeExecutioner")
 
 # Die Funktion, die beim Start der Anwendung ausgeführt wird
 @app.on_event("startup")
@@ -34,6 +35,7 @@ def read_root():
 # Dieser Block stellt sicher, dass die Anwendung nur gestartet wird,
 # wenn die Datei direkt ausgeführt wird (z.B. mit 'python main.py').
 if __name__ == "__main__":
+    local_port = int(os.environ.get("PORT", 8000))
     # Uvicorn startet den ASGI-Server.
     # Hier wird 'app' aus der aktuellen Datei ('main') geladen.
     # host='0.0.0.0' macht die App von außen erreichbar (wichtig für Container/Server).
