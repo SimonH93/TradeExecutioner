@@ -213,7 +213,7 @@ async def get_current_price(symbol: str, product_type: str = "USDT-FUTURES") -> 
         logging.error("Unexpected response structure: %s - Error: %s", data, e)
         raise Exception(f"Unexpected response: {data}")
 
-async def get_symbol_metadata(base_symbol: str) -> int:
+async def get_symbol_metadata(base_symbol: str) -> dict:
     global SYMBOL_INFO_CACHE
     
     if base_symbol in SYMBOL_INFO_CACHE:
@@ -222,7 +222,12 @@ async def get_symbol_metadata(base_symbol: str) -> int:
     url = f"{BASE_URL}/api/v3/market/instruments" 
     params = {"category": "USDT-FUTURES"} # USDT-M Contracts
 
-    fallback = {"sizeScale": 4, "priceScale": 4} 
+    fallback = {
+        "sizeScale": 4, 
+        "priceScale": 4,
+        "maxLimitQty": float('inf'),
+        "maxMarketQty": float('inf')
+        } 
 
     try:
         async with httpx.AsyncClient(timeout=5) as client:
@@ -240,23 +245,35 @@ async def get_symbol_metadata(base_symbol: str) -> int:
             if symbol == base_symbol: 
                 size_scale_raw = symbol_info.get("quantityPrecision")
                 price_scale_raw = symbol_info.get("pricePrecision")
-                
+                max_order_qty_raw = symbol_info.get("maxOrderQty")
+                max_market_qty_raw = symbol_info.get("maxMarketOrderQty")
+
                 if size_scale_raw is None or price_scale_raw is None:
                     logging.warning("Precision (quantityPrecision or pricePrecision) not found for %s. Defaulting to 4/4.", base_symbol)
                     return fallback
-                size_scale = int(size_scale_raw)
-                price_scale = int(price_scale_raw)
-                
-                metadata = {
-                    "sizeScale": size_scale,
-                    "priceScale": price_scale
-                }
+                else:
+                    metadata = {
+                        "sizeScale": int(size_scale_raw),
+                        "priceScale": int(price_scale_raw)
+                    }
+
+                if max_order_qty_raw is not None:
+                    metadata["maxLimitQty"] = float(max_order_qty_raw)
+                if max_market_qty_raw is not None:
+                    metadata["maxMarketQty"] = float(max_market_qty_raw)
+                metadata.setdefault("maxLimitQty", fallback["maxLimitQty"])
+                metadata.setdefault("maxMarketQty", fallback["maxMarketQty"])
 
                 SYMBOL_INFO_CACHE[base_symbol] = metadata
-                logging.info("[DEBUG] Fetched metadata for %s: quantityPrecision=%d, pricePrecision=%d", 
-                             base_symbol, size_scale, price_scale)
+                logging.info("[DEBUG] Fetched metadata for %s: quantityPrecision=%d, pricePrecision=%d, maxLimitQty=%f, maxMarketQty=%f", 
+                             base_symbol, 
+                             metadata["sizeScale"], 
+                             metadata["priceScale"], 
+                             metadata["maxLimitQty"], 
+                             metadata["maxMarketQty"])
                 return metadata
-        logging.warning("Metadata not found for symbol %s in market instruments list. Defaulting to 4/4.", base_symbol)
+                
+        logging.warning("Metadata not found for symbol %s in market instruments list. Defaulting to fallback.", base_symbol)
         return fallback
         
     except Exception as e:
@@ -277,39 +294,43 @@ async def get_price_scale(base_symbol: str) -> int:
 async def get_position_size(base_symbol: str, usdt_budget: float = None, leverage: float = None, product_type: str = "USDT-FUTURES"):
     usdt_budget = usdt_budget or USDT_BUDGET
     leverage = leverage or DEFAULT_LEVERAGE
-
-    size_scale = await get_quantity_scale(base_symbol)
+    metadata = await get_symbol_metadata(base_symbol)
+    size_scale = metadata.get("sizeScale", 4)
+    max_market_qty = metadata.get("maxMarketQty")
+    max_limit_qty = metadata.get("maxLimitQty")
     
     # Aktueller Preis
     price = await get_current_price(base_symbol, product_type)
-    total_size_raw = (usdt_budget * leverage) / price
-    total_size = round(total_size_raw, size_scale)
-
-    tp_sizes_raw = [
-        total_size_raw * 0.5,  # TP1 = 50%
-        total_size_raw * 0.3,  # TP2 = 30%
-    ]
+    total_size_raw_desired = (usdt_budget * leverage) / price
     
-    tp_sizes = [round(s, size_scale) for s in tp_sizes_raw]
+    total_size_raw_final = min(total_size_raw_desired, max_market_qty, max_limit_qty)
 
+    if total_size_raw_final < total_size_raw_desired:
+        logging.warning("Desired size (%.2f) reduced to max allowed size (%.2f) due to exchange limits (Market or Limit Qty).", 
+                        total_size_raw_desired, total_size_raw_final)
+    
+    total_size = round(total_size_raw_final, size_scale)
+
+    if total_size <= 0 and total_size_raw_desired > 0:
+        logging.warning("Calculated position size %f was rounded down to 0 or below due to precision or minimum size.", total_size_raw_desired)
+    
+    tp_sizes_raw_splits = [
+        total_size * 0.5,  # TP1 = 50%
+        total_size * 0.3,  # TP2 = 30%
+    ]
+    tp_sizes = [round(s, size_scale) for s in tp_sizes_raw_splits]
+    # Berechnung des Rests (TP3)
     tp3_size_raw = total_size - sum(tp_sizes)
-    tp3_size = round(tp3_size_raw, size_scale) # Stelle sicher, dass TP3 ebenfalls korrekt gerundet ist
+    tp3_size = round(tp3_size_raw, size_scale)
 
-    # Füge TP3 hinzu, aber nur wenn es größer als 0 ist
     if tp3_size > 0:
         tp_sizes.append(tp3_size)
     else:
-        # Falls TP3 zu klein ist, verteilen wir den Rest auf TP2 (oder TP1)
-        if len(tp_sizes) >= 2:
+        # Falls TP3 zu klein ist, den Rest auf den letzten gültigen TP aufschlagen
+        if len(tp_sizes) > 0:
             tp_sizes[-1] = round(tp_sizes[-1] + tp3_size_raw, size_scale)
-        elif len(tp_sizes) == 1:
-            tp_sizes[0] = round(tp_sizes[0] + tp3_size_raw, size_scale)
     
-
-    # Final prüfen, ob die Gesamtgröße durch die Rundung auf 0 gefallen ist (Minimale Größe)
-    if total_size <= 0 and total_size_raw > 0:
-         logging.warning("Calculated position size %f was rounded down to 0 or below due to precision or minimum size.", total_size_raw)
-
+    
     print(f"[DEBUG] get_position_size: symbol={base_symbol}, price={price}, sizeScale={size_scale}, total_size={total_size}, tp_sizes={tp_sizes}")
     
     return total_size, tp_sizes
