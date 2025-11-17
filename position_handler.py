@@ -302,20 +302,21 @@ async def cancel_and_replace_sl(symbol: str, old_sl: dict, new_size: float, posi
     old_plan_id = old_sl["planId"]
     old_size = old_sl["size"]
     trigger_price = old_sl["triggerPrice"]
+    rounded_trigger_price = round(trigger_price, 4)
 
     logging.warning(f"--- KORREKTUR ERFORDERLICH für {symbol} ---")
     logging.warning(f"  Position: {new_size:.4f}, SL-Order: {old_size:.4f} (Plan-ID: {old_plan_id})")
     
     # 1. Storniere die alte, überdimensionierte SL-Order
-    # Wir verwenden planType: "pos_loss"
+    # Wir verwenden planType: "normal_plan"
     cancel_payload = {
         "symbol": symbol,
         "productType": "UMCBL",
         "marginCoin": "USDT", 
         "orderId": old_plan_id, 
-        "planType": "pos_loss" 
+        "planType": "normal_plan" 
     }
-    logging.info(f"  -> Storniere alte SL-Order {old_plan_id} mit generischem Plan-Endpunkt ({CANCEL_PLAN_URL}, planType: pos_loss)...")
+    logging.info(f"  -> Storniere alte SL-Order {old_plan_id} mit generischem Plan-Endpunkt ({CANCEL_PLAN_URL}, planType: normal_plan)...")
     
     # make_api_request fängt 40034/43020 ab und gibt {} zurück, um Platzierung zu erlauben.
     cancel_result = await make_api_request("POST", BASE_URL + CANCEL_PLAN_URL, json_data=cancel_payload)
@@ -352,12 +353,12 @@ async def cancel_and_replace_sl(symbol: str, old_sl: dict, new_size: float, posi
         "orderType": "market", 
         "productType": "UMCBL",
         "marginCoin": "USDT",
-        "triggerPrice": str(trigger_price),
+        "triggerPrice": str(rounded_trigger_price),
         "triggerType": "mark_price",
         "executePrice": execute_price 
     }
     
-    logging.info(f"  -> Platziere neue SL-Order: Side={new_side}, Größe={new_size:.4f}, Trigger={trigger_price}")
+    logging.info(f"  -> Platziere neue SL-Order: Side={new_side}, Größe={new_size:.4f}, Trigger={rounded_trigger_price}")
     new_order_result = await make_api_request("POST", BASE_URL + PLACE_PLAN_URL, json_data=place_payload)
     
     if new_order_result:

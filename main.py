@@ -677,7 +677,7 @@ async def place_bitget_trade(signal, test_mode=True):
             side=closing_side,
             is_sl=False # Marks as TP -> orderType="limit"
         )
-        logging.info(f"TP{i+1} Plan Order (Price: {tp_price}, Size: {tp_size}) Response: %s", tp_resp)
+        logging.info(f"TP{i+1} Plan order (Price: {tp_price}, Size: {tp_size}) Response: %s", tp_resp)
         
     logging.info("[INFO] Alle Orders (Market, SL, 3xTP) wurden gesendet.")
 
