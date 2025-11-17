@@ -465,7 +465,11 @@ async def set_leverage(symbol: str, leverage: int, margin_mode: str = "isolated"
         logging.error("[ERROR] Set Leverage Request failed (network/timeout): %s", e)
         return False
 
-async def place_market_order(symbol, size, side, leverage=10):
+async def place_market_order(symbol, size, side, leverage=10, retry_count=0):
+    if retry_count >= 3:
+        logging.error("Markt Order after %d tries failed. Trade cancelled.", retry_count)
+        return None
+    
     url_path = "/api/mix/v1/order/placeOrder"
     url = f"{BASE_URL}{url_path}"
     timestamp = str(int(time.time() * 1000))
@@ -496,14 +500,32 @@ async def place_market_order(symbol, size, side, leverage=10):
         async with httpx.AsyncClient(timeout=5) as client:
             resp = await client.post(url, headers=headers, data=body)
         
-            if resp.status_code >= 400:
-                try:
-                    error_data = resp.json()
-                    logging.error("[ERROR 4xx/5xx MARKET ORDER] Bitget API Status Code %d. Response Body: %s (Payload: %s)", 
-                                  resp.status_code, error_data, payload)
-                except json.JSONDecodeError:
-                    logging.error("[ERROR 4xx/5xx MARKET ORDER] Bitget API Status Code %d. Response Text: %s (Payload: %s)", 
-                                  resp.status_code, resp.text, payload)
+        if resp.status_code >= 400:
+            error_data = resp.json()
+            if error_data.get("code") == "40921":
+                
+                # Strategy: Reduce size in 5% steps and try again
+                new_size_raw = size * 0.95 
+                # Wichtig: Holen Sie die Präzision (Scale) für die korrekte Rundung
+                base_symbol = symbol.replace("_UMCBL", "")
+                metadata = await get_symbol_metadata(base_symbol)
+                size_scale = metadata.get("sizeScale", 0) 
+                
+                new_size = round(new_size_raw, size_scale)
+                
+                logging.warning(
+                    "[RETRY 40921] Size %s exceeds positions-level-limit. Try with reduced order size (%.2f%%): %s", 
+                    size, 
+                    (1 - 0.95) * 100,
+                    new_size
+                )
+                # Recursive call with smaller size
+                return await place_market_order(symbol, new_size, side, leverage, retry_count + 1)
+                
+            else:
+                # Check other 4xx/5xx errors
+                logging.error("[ERROR 4xx/5xx MARKET ORDER] Bitget API Status Code %d. Response Body: %s (Payload: %s)", 
+                              resp.status_code, error_data, payload)
                 return None
 
         data = resp.json() 
