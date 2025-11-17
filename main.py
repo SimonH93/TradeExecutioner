@@ -11,6 +11,7 @@ import time
 import httpx
 import uvicorn
 from telethon import TelegramClient, events
+from telethon.sessions import StringSession
 from dotenv import load_dotenv
 from fastapi import FastAPI, Request
 
@@ -109,36 +110,34 @@ if not all([BITGET_API_KEY, BITGET_API_SECRET, BITGET_PASSWORD, API_ID, API_HASH
     raise ValueError("Mindestens ein benötigtes API Credential (Bitget oder Telegram) fehlt in .env")
 
 async def run_client():
-    if SESSION_BASE64:
-        session_filepath = f"{SESSION_NAME}.session"
-    try:
-        # Decode the Base64 string into binary data
-        session_data = base64.b64decode(SESSION_BASE64)
-        # Save the .session file in the container
-        with open(session_filepath, 'wb') as f:
-            f.write(session_data)
-        logging.info("Telethon Session erfolgreich aus Base64 dekodiert und als Datei gespeichert.")
-    except Exception as e:
-        logging.error("Fehler beim Dekodieren oder Speichern der Session-Datei: %s", e)
+    if not SESSION_BASE64:
+        logging.error("SESSION_BASE64 ist leer. Kann Client nicht starten.")
         return
-
-    # client is initialized as 'user' (phone=None, as the session file will be loaded later)
-    client = TelegramClient(SESSION_NAME, API_ID, API_HASH)
-
+        
     try:
+        # --- 1. Client Initialisierung (Korrekt mit StringSession) ---
+        client = TelegramClient(
+            session=StringSession(SESSION_BASE64),
+            api_id=API_ID, 
+            api_hash=API_HASH
+        )
+        
         await client.start()
         
-        # IMPORTANT: Initial login requires code entry in a terminal.
-        # Since Railway is non-interactive, you MUST log in locally first 
-        # to generate the session file (bot_session.session), 
-        # and then provide it via the TELEGRAM_SESSION_PART environment variables.
-        logging.info("Telethon Client gestartet.")
+        if not await client.is_user_authorized():
+            logging.error("Client ist nicht autorisiert. Bitte prüfen Sie, ob der TELEGRAM_SESSION_PART... String korrekt und vollständig ist.")
+            return
+        
+        logging.info("✅ Telethon Client erfolgreich mit StringSession gestartet.")
         
     except Exception as e:
-        logging.error("Fehler beim Starten des Telethon-Clients: %s", e)
+        logging.critical("Kritischer Fehler beim Starten des Telethon-Clients: %s", e)
         return
 
-    # Register the new message handler, filtering only messages from defined Source Channels
+    # --------------------------------------------------------------------------------
+    # --- 2. Event Handler Registrierung (NUR HIER EINMAL!) ---
+    # --------------------------------------------------------------------------------
+
     @client.on(events.NewMessage(chats=list(SOURCE_CHANNELS)))
     async def handler(event):
         """Processes every new message from the monitored channels."""
@@ -172,9 +171,12 @@ async def run_client():
             logging.debug("Kein valides Handelssignal in der Nachricht.")
 
 
+    # --------------------------------------------------------------------------------
+    # --- 3. Client laufen lassen (NUR HIER EINMAL!) ---
+    # --------------------------------------------------------------------------------
+    
     # Keep the client running until disconnected
     await client.run_until_disconnected()
-
 
 # --- START THE APPLICATION ---
 
