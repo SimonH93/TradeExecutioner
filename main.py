@@ -626,10 +626,10 @@ async def place_bitget_trade(signal, test_mode=True):
 
     if signal["type"].upper() == "LONG":
         market_side_open = "open_long"
-        closing_side = "close_short"  # Closes LONG position
+        closing_side = "close_long"  # Closes LONG position
     else: # SHORT
         market_side_open = "open_short"
-        closing_side = "close_long"   # Closes SHORT position
+        closing_side = "close_short"   # Closes SHORT position
     
     if test_mode:
         logging.info("[TEST MODE] Market Order, SL und TP Orders werden nicht gesendet")
