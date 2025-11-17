@@ -555,7 +555,7 @@ async def place_conditional_order(symbol, size, trigger_price, side: str, is_sl:
         "marginCoin": "USDT",
         "triggerPrice": str(rounded_price),
         "triggerType": "mark_price",
-        "entrustPrice": entrust_price
+        "executePrice": entrust_price
     }
     
     body = json.dumps(payload)
