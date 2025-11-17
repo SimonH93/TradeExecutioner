@@ -49,8 +49,8 @@ for key, value in os.environ.items():
 SESSION_PARTS.sort(key=lambda x: x[0])
 SESSION_BASE64 = "".join([part[1] for part in SESSION_PARTS])
 
-logging.info(f"DEBUG: SESSION_BASE64 Länge: {len(SESSION_BASE64)}")
-logging.info(f"DEBUG: SESSION_BASE64 Start: {SESSION_BASE64[:10]}... Ende: {SESSION_BASE64[-10:]}")
+logging.critical(f"DEBUG: SESSION_BASE64 Länge: {len(SESSION_BASE64)}")
+logging.critical(f"DEBUG: SESSION_BASE64 Start: {SESSION_BASE64[:10]}... Ende: {SESSION_BASE64[-10:]}")
 
 if SESSION_BASE64:
     logging.info("Telethon Session Content gefunden und aus %d Teilen zusammengesetzt.", len(SESSION_PARTS))
