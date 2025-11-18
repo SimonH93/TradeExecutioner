@@ -49,9 +49,6 @@ for key, value in os.environ.items():
 SESSION_PARTS.sort(key=lambda x: x[0])
 SESSION_BASE64 = "".join([part[1] for part in SESSION_PARTS])
 
-logging.critical(f"DEBUG: SESSION_BASE64 Länge: {len(SESSION_BASE64)}")
-logging.critical(f"DEBUG: SESSION_BASE64 Start: {SESSION_BASE64[:10]}... Ende: {SESSION_BASE64[-10:]}")
-
 if SESSION_BASE64:
     logging.info("Telethon Session Content gefunden und aus %d Teilen zusammengesetzt.", len(SESSION_PARTS))
 else:
@@ -74,17 +71,18 @@ for item in SOURCE_CHANNELS_RAW.split(','):
     try:
         chat_id_raw = parts[0]
         # Add the main ID to the filter set (for messages without a thread)
-        SOURCE_FILTERS.add(chat_id_raw)
+        if len(parts) == 1 or not parts[1].strip():
+            # Wenn nur Chat-ID (z.B. "-100...") vorhanden ist, füge sie hinzu
+            SOURCE_FILTERS.add(chat_id_raw)
         
         # Add the main ID to the Telethon event list (must be an integer if negative)
         chat_id = int(chat_id_raw) if chat_id_raw.startswith('-') else chat_id_raw
         SOURCE_CHANNELS.add(chat_id)
         
         # If a thread ID is present, also add the combination to the filter set
-        if len(parts) > 1:
+        if len(parts) > 1 and parts[1].strip():
             thread_id = parts[1]
-            if thread_id:
-                SOURCE_FILTERS.add(f"{chat_id_raw}:{thread_id}")
+            SOURCE_FILTERS.add(f"{chat_id_raw}:{thread_id}")
 
     except ValueError:
         logging.warning("Ungültiges Format in TELEGRAM_SOURCE_CHANNELS gefunden: %s. Ignoriere.", item)
@@ -92,6 +90,10 @@ for item in SOURCE_CHANNELS_RAW.split(','):
 if not SOURCE_CHANNELS and SOURCE_CHANNELS_RAW:
     logging.warning("Keine gültigen Kanal-IDs in TELEGRAM_SOURCE_CHANNELS gefunden.")
 
+logging.info(f"*** FINAL SOURCE CONFIGURATION ***")
+logging.info(f"SOURCE_CHANNELS (Telethon Listener): {SOURCE_CHANNELS}")
+logging.info(f"SOURCE_FILTERS (Topic Checker): {SOURCE_FILTERS}")
+logging.info(f"*********************************")
 
 # Cache for symbol information (Precision, Min Size, etc.)
 SYMBOL_INFO_CACHE = {} 
