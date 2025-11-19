@@ -4,62 +4,31 @@ import hashlib
 import hmac
 import json
 import logging
+import uvicorn
 import os
 import re
 import time
 
 import httpx
-import uvicorn
-from telethon import TelegramClient, events
-from telethon.sessions import StringSession
 from dotenv import load_dotenv
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, HTTPException
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 app = FastAPI()
 
-@app.get("/")
-def read_root():
-    """Zeigt den Status an. Wird von Railway für den Health Check benötigt."""
-    return {"status": "Service is running", "message": "OK - User Client is listening in background."}
-
-
 load_dotenv()
-# --- Telethon Config ---
-API_ID = os.getenv("TELEGRAM_API_ID")
-API_HASH = os.getenv("TELEGRAM_API_HASH")
-SESSION_NAME = os.getenv("TELEGRAM_SESSION_FILE", "bot_session") 
-SESSION_PARTS = []
+# --- Bot Config ---
+BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN") 
+if not BOT_TOKEN:
+    logging.error("TELEGRAM_BOT_TOKEN fehlt in den Umgebungsvariablen!")
 
-# Search all environment variables
-for key, value in os.environ.items():
-    # Check for prefix and ensure value is not empty
-    if key.startswith("TELEGRAM_SESSION_PART") and value:
-        try:
-            # # Extract the part number (e.g. '1' from 'TELEGRAM_SESSION_PART1')
-            part_number_str = key.replace("TELEGRAM_SESSION_PART", "")
-            part_number = int(part_number_str)
-            SESSION_PARTS.append((part_number, value))
-        except ValueError:
-            # Ignore keys not ending with a number
-            continue 
-
-# Sort by part number (1, 2, 3...)
-SESSION_PARTS.sort(key=lambda x: x[0])
-SESSION_BASE64 = "".join([part[1] for part in SESSION_PARTS])
-
-if SESSION_BASE64:
-    logging.info("Telethon Session Content gefunden und aus %d Teilen zusammengesetzt.", len(SESSION_PARTS))
-else:
-    logging.warning("Kein TELEGRAM_SESSION_PART... Umgebungsvariable gefunden.")
-
+# --- CONFIG: Source Channels ---
 SOURCE_CHANNELS_RAW = os.getenv("TELEGRAM_SOURCE_CHANNELS", "")
 if not SOURCE_CHANNELS_RAW:
     logging.error("TELEGRAM_SOURCE_CHANNELS Umgebungsvariable fehlt!")
 
 SOURCE_FILTERS = set()
-SOURCE_CHANNELS = set()
 
 for item in SOURCE_CHANNELS_RAW.split(','):
     item = item.strip()
@@ -67,32 +36,26 @@ for item in SOURCE_CHANNELS_RAW.split(','):
     
     # Item can be either just the chat ID or Chat ID:Thread ID
     parts = item.split(':')
+    chat_id_raw = parts[0].strip()
+    # Add the main ID to the filter set (for messages without a thread)
+    if len(parts) > 1 and parts[1].strip():
+        # Fall A: User gibt "CHAT_ID:THREAD_ID" an
+        # Wir speichern NUR die Kombination. Die reine Chat-ID wird NICHT gespeichert.
+        thread_id = parts[1].strip()
+        full_key = f"{chat_id_raw}:{thread_id}"
+        SOURCE_FILTERS.add(full_key)
+        logging.info(f"Filter hinzugefügt (Nur Topic): {full_key}")
+    else:
+        # Fall B: User gibt nur "CHAT_ID" an
+        # Wir speichern die ID als Wildcard für die ganze Gruppe
+        SOURCE_FILTERS.add(chat_id_raw)
+        logging.info(f"Filter hinzugefügt (Ganze Gruppe): {chat_id_raw}")
     
-    try:
-        chat_id_raw = parts[0]
-        # Add the main ID to the filter set (for messages without a thread)
-        if len(parts) == 1 or not parts[1].strip():
-            # Wenn nur Chat-ID (z.B. "-100...") vorhanden ist, füge sie hinzu
-            SOURCE_FILTERS.add(chat_id_raw)
-        
-        # Add the main ID to the Telethon event list (must be an integer if negative)
-        chat_id = int(chat_id_raw) if chat_id_raw.startswith('-') else chat_id_raw
-        SOURCE_CHANNELS.add(chat_id)
-        
-        # If a thread ID is present, also add the combination to the filter set
-        if len(parts) > 1 and parts[1].strip():
-            thread_id = parts[1]
-            SOURCE_FILTERS.add(f"{chat_id_raw}:{thread_id}")
-
-    except ValueError:
-        logging.warning("Ungültiges Format in TELEGRAM_SOURCE_CHANNELS gefunden: %s. Ignoriere.", item)
-
-if not SOURCE_CHANNELS and SOURCE_CHANNELS_RAW:
+if not SOURCE_FILTERS and SOURCE_CHANNELS_RAW:
     logging.warning("Keine gültigen Kanal-IDs in TELEGRAM_SOURCE_CHANNELS gefunden.")
 
 logging.info(f"*** FINAL SOURCE CONFIGURATION ***")
-logging.info(f"SOURCE_CHANNELS (Telethon Listener): {SOURCE_CHANNELS}")
-logging.info(f"SOURCE_FILTERS (Topic Checker): {SOURCE_FILTERS}")
+logging.info(f"SOURCE_FILTERS (Allowed Webhooks): {SOURCE_FILTERS}")
 logging.info(f"*********************************")
 
 # Cache for symbol information (Precision, Min Size, etc.)
@@ -111,84 +74,77 @@ TEST_MODE = os.getenv("BITGET_TEST_MODE", "True").lower() == "true"
 # Base URL for Bitget Futures
 BASE_URL = "https://api.bitget.com"
 
-if not all([BITGET_API_KEY, BITGET_API_SECRET, BITGET_PASSWORD, API_ID, API_HASH]):
-    raise ValueError("Mindestens ein benötigtes API Credential (Bitget oder Telegram) fehlt in .env")
+if not all([BITGET_API_KEY, BITGET_API_SECRET, BITGET_PASSWORD]):
+    raise ValueError("Mindestens ein benötigtes API Credential fehlt in .env")
 
-async def run_client():
-    if not SESSION_BASE64:
-        logging.error("SESSION_BASE64 ist leer. Kann Client nicht starten.")
-        return
-        
+@app.get("/")
+def read_root():
+    """Health Check."""
+    return {"status": "Service is running", "mode": "Webhook Bot"}
+
+@app.post(f"/webhook/{BOT_TOKEN}")
+async def telegram_webhook(request: Request):
     try:
-        # --- 1. Client Initialisierung (Korrekt mit StringSession) ---
-        client = TelegramClient(
-            session=StringSession(SESSION_BASE64),
-            api_id=API_ID, 
-            api_hash=API_HASH
-        )
-        
-        await client.start()
-        
-        if not await client.is_user_authorized():
-            logging.error("Client ist nicht autorisiert. Bitte prüfen Sie, ob der TELEGRAM_SESSION_PART... String korrekt und vollständig ist.")
-            return
-        
-        logging.info("✅ Telethon Client erfolgreich mit StringSession gestartet.")
-        
-    except Exception as e:
-        logging.critical("Kritischer Fehler beim Starten des Telethon-Clients: %s", e)
-        return
+        update = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON")
 
-    # --------------------------------------------------------------------------------
-    # --- 2. Event Handler Registrierung (NUR HIER EINMAL!) ---
-    # --------------------------------------------------------------------------------
+    # 1. Daten aus dem Update holen
+    # 'channel_post' ist für Kanäle, 'message' für Gruppen/Privat
+    msg = update.get("channel_post") or update.get("message") or update.get("edited_channel_post") or update.get("edited_message")
 
-    @client.on(events.NewMessage(chats=list(SOURCE_CHANNELS)))
-    async def handler(event):
-        """Processes every new message from the monitored channels."""
-        message_text = event.message.message
-        
-        logging.debug(f"Event received for Chat ID: {event.chat_id} (Type: {type(event.chat_id)}), Message: {message_text[:30]}...")
-        
-        # Ignore empty messages or those that are only pictures
-        if not message_text:
-             return
-        
-        chat_id_str = str(event.chat_id)
-        thread_id = getattr(event.message, 'reply_to_top_id', None)
-        filter_key = chat_id_str
-        if thread_id:
-            filter_key = f"{chat_id_str}:{thread_id}"
-            
-        if filter_key not in SOURCE_FILTERS:
-            logging.debug("Nachricht von nicht autorisiertem Thread/Chat %s empfangen. Ignoriere.", filter_key)
-            return
-            
-        logging.info(f"Nachricht von autorisiertem Chat/Thread {filter_key} empfangen: {message_text[:50]}...")
+    if not msg:
+        return {"status": "ignored", "reason": "no_message_content"}
 
-        # The core webhook logic is here
-        signal = await parse_signal(message_text)
+    # 2. IDs exakt extrahieren
+    try:
+        # Telegram sendet die Chat ID als Integer (z.B. -100285...), wir brauchen String
+        chat_id = str(msg["chat"]["id"]) 
         
-        if signal:
-            logging.info("Signal erkannt: %s", signal)
-            await place_bitget_trade(signal, test_mode=TEST_MODE)
-        else:
-            logging.debug("Kein valides Handelssignal in der Nachricht.")
+        # Telegram sendet 'message_thread_id' nur, wenn es sich um ein Topic handelt.
+        # Wenn es fehlt, ist es None.
+        thread_id_int = msg.get("message_thread_id")
+        thread_id = str(thread_id_int) if thread_id_int is not None else None
+        
+        text = msg.get("text", "")
+    except KeyError:
+        return {"status": "ignored", "reason": "malformed_data"}
 
+    if not text:
+        return {"status": "ignored", "reason": "empty_text"}
 
-    # --------------------------------------------------------------------------------
-    # --- 3. Client laufen lassen (NUR HIER EINMAL!) ---
-    # --------------------------------------------------------------------------------
+    # 3. Strenge Autorisierungs-Prüfung
+    is_authorized = False
     
-    # Keep the client running until disconnected
-    await client.run_until_disconnected()
+    # Wir bauen den Key, den diese Nachricht repräsentiert
+    current_specific_key = f"{chat_id}:{thread_id}" if thread_id else chat_id
+
+    # LOGIK:
+    # A) Ist exakt dieses Topic erlaubt? (z.B. "-100...:1085")
+    if current_specific_key in SOURCE_FILTERS:
+        is_authorized = True
+    
+    # B) Ist die ganze Gruppe als Wildcard erlaubt? (z.B. "-100...")
+    # Das prüfen wir nur, wenn Fall A nicht schon zutraf
+    elif chat_id in SOURCE_FILTERS:
+        is_authorized = True
+
+    logging.debug(f"Webhook Check: Chat='{chat_id}', Thread='{thread_id}' -> Key='{current_specific_key}'. Authorized={is_authorized}")
+
+    if not is_authorized:
+        return {"status": "ignored", "reason": "unauthorized_chat_or_thread"}
+
+    logging.info(f"Autorisierte Nachricht empfangen: {text[:50]}...")
+
+    # ... (Ab hier weiter mit parse_signal und place_bitget_trade wie zuvor) ...
+    signal = await parse_signal(text)
+    if signal:
+        logging.info("Signal erkannt: %s", signal)
+        asyncio.create_task(place_bitget_trade(signal, test_mode=TEST_MODE))
+
+    return {"status": "ok"}
 
 # --- START THE APPLICATION ---
-
-@app.on_event("startup")
-async def startup_event():
-    # Start the client task without blocking the FastAPI server
-    asyncio.create_task(run_client())
 
 
 async def get_current_price(symbol: str, product_type: str = "USDT-FUTURES") -> float:
@@ -303,7 +259,6 @@ async def get_position_size(base_symbol: str, usdt_budget: float = None, leverag
     # Current Price
     price = await get_current_price(base_symbol, product_type)
     total_size_raw_desired = (usdt_budget * leverage) / price
-    
     total_size_raw_final = min(total_size_raw_desired, max_market_qty, max_limit_qty)
 
     if total_size_raw_final < total_size_raw_desired:
@@ -329,9 +284,6 @@ async def get_position_size(base_symbol: str, usdt_budget: float = None, leverag
     else:
         if len(tp_sizes) > 0:
             tp_sizes[-1] = round(tp_sizes[-1] + tp3_size_raw, size_scale)
-    
-    
-    print(f"[DEBUG] get_position_size: symbol={base_symbol}, price={price}, sizeScale={size_scale}, total_size={total_size}, tp_sizes={tp_sizes}")
     
     return total_size, tp_sizes
 
@@ -687,7 +639,6 @@ async def place_bitget_trade(signal, test_mode=True):
         logging.info(f"TP{i+1} Plan order (Price: {tp_price}, Size: {tp_size}) Response: %s", tp_resp)
         
     logging.info("[INFO] Alle Orders (Market, SL, 3xTP) wurden gesendet.")
-
 
 if __name__ == "__main__":
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
