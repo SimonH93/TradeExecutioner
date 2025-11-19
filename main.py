@@ -16,47 +16,7 @@ from fastapi import FastAPI, Request, HTTPException
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
 app = FastAPI()
-
 load_dotenv()
-# --- Bot Config ---
-BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN") 
-if not BOT_TOKEN:
-    logging.error("TELEGRAM_BOT_TOKEN fehlt in den Umgebungsvariablen!")
-
-# --- CONFIG: Source Channels ---
-SOURCE_CHANNELS_RAW = os.getenv("TELEGRAM_SOURCE_CHANNELS", "")
-if not SOURCE_CHANNELS_RAW:
-    logging.error("TELEGRAM_SOURCE_CHANNELS Umgebungsvariable fehlt!")
-
-SOURCE_FILTERS = set()
-
-for item in SOURCE_CHANNELS_RAW.split(','):
-    item = item.strip()
-    if not item: continue
-    
-    # Item can be either just the chat ID or Chat ID:Thread ID
-    parts = item.split(':')
-    chat_id_raw = parts[0].strip()
-    # Add the main ID to the filter set (for messages without a thread)
-    if len(parts) > 1 and parts[1].strip():
-        # Fall A: User gibt "CHAT_ID:THREAD_ID" an
-        # Wir speichern NUR die Kombination. Die reine Chat-ID wird NICHT gespeichert.
-        thread_id = parts[1].strip()
-        full_key = f"{chat_id_raw}:{thread_id}"
-        SOURCE_FILTERS.add(full_key)
-        logging.info(f"Filter hinzugefügt (Nur Topic): {full_key}")
-    else:
-        # Fall B: User gibt nur "CHAT_ID" an
-        # Wir speichern die ID als Wildcard für die ganze Gruppe
-        SOURCE_FILTERS.add(chat_id_raw)
-        logging.info(f"Filter hinzugefügt (Ganze Gruppe): {chat_id_raw}")
-    
-if not SOURCE_FILTERS and SOURCE_CHANNELS_RAW:
-    logging.warning("Keine gültigen Kanal-IDs in TELEGRAM_SOURCE_CHANNELS gefunden.")
-
-logging.info(f"*** FINAL SOURCE CONFIGURATION ***")
-logging.info(f"SOURCE_FILTERS (Allowed Webhooks): {SOURCE_FILTERS}")
-logging.info(f"*********************************")
 
 # Cache for symbol information (Precision, Min Size, etc.)
 SYMBOL_INFO_CACHE = {} 
@@ -82,61 +42,23 @@ def read_root():
     """Health Check."""
     return {"status": "Service is running", "mode": "Webhook Bot"}
 
-@app.post(f"/webhook/{BOT_TOKEN}")
-async def telegram_webhook(request: Request):
-    try:
-        update = await request.json()
-    except Exception:
-        raise HTTPException(status_code=400, detail="Invalid JSON")
-
-    # 1. Daten aus dem Update holen
-    # 'channel_post' ist für Kanäle, 'message' für Gruppen/Privat
+# NEU: Empfängt den HTTP POST vom Router-Service
+@app.post("/process_signal")
+async def process_router_signal(update: dict):
+    # Wichtig: Die Autorisierung ist jetzt implizit, da nur der Router senden soll
+    # Ihre Autorisierungs- und Filterlogik muss hier eventuell entfernt/vereinfacht werden.
+    
+    # 1. Die Nachricht aus dem Update holen (genau wie im Router)
     msg = update.get("channel_post") or update.get("message") or update.get("edited_channel_post") or update.get("edited_message")
-
+    
     if not msg:
         return {"status": "ignored", "reason": "no_message_content"}
-
-    # 2. IDs exakt extrahieren
-    try:
-        # Telegram sendet die Chat ID als Integer (z.B. -100285...), wir brauchen String
-        chat_id = str(msg["chat"]["id"]) 
         
-        # Telegram sendet 'message_thread_id' nur, wenn es sich um ein Topic handelt.
-        # Wenn es fehlt, ist es None.
-        thread_id_int = msg.get("message_thread_id")
-        thread_id = str(thread_id_int) if thread_id_int is not None else None
-        
-        text = msg.get("text", "")
-    except KeyError:
-        return {"status": "ignored", "reason": "malformed_data"}
+    text = msg.get("text", "")
 
-    if not text:
-        return {"status": "ignored", "reason": "empty_text"}
-
-    # 3. Strenge Autorisierungs-Prüfung
-    is_authorized = False
+    logging.info(f"Signal vom Router empfangen: {text[:50]}...")
     
-    # Wir bauen den Key, den diese Nachricht repräsentiert
-    current_specific_key = f"{chat_id}:{thread_id}" if thread_id else chat_id
-
-    # LOGIK:
-    # A) Ist exakt dieses Topic erlaubt? (z.B. "-100...:1085")
-    if current_specific_key in SOURCE_FILTERS:
-        is_authorized = True
-    
-    # B) Ist die ganze Gruppe als Wildcard erlaubt? (z.B. "-100...")
-    # Das prüfen wir nur, wenn Fall A nicht schon zutraf
-    elif chat_id in SOURCE_FILTERS:
-        is_authorized = True
-
-    logging.debug(f"Webhook Check: Chat='{chat_id}', Thread='{thread_id}' -> Key='{current_specific_key}'. Authorized={is_authorized}")
-
-    if not is_authorized:
-        return {"status": "ignored", "reason": "unauthorized_chat_or_thread"}
-
-    logging.info(f"Autorisierte Nachricht empfangen: {text[:50]}...")
-
-    # ... (Ab hier weiter mit parse_signal und place_bitget_trade wie zuvor) ...
+    # 2. Den Signal-Prozess starten
     signal = await parse_signal(text)
     if signal:
         logging.info("Signal erkannt: %s", signal)
@@ -145,7 +67,6 @@ async def telegram_webhook(request: Request):
     return {"status": "ok"}
 
 # --- START THE APPLICATION ---
-
 
 async def get_current_price(symbol: str, product_type: str = "USDT-FUTURES") -> float:
     url = f"{BASE_URL}/api/v2/mix/market/ticker"
@@ -639,6 +560,3 @@ async def place_bitget_trade(signal, test_mode=True):
         logging.info(f"TP{i+1} Plan order (Price: {tp_price}, Size: {tp_size}) Response: %s", tp_resp)
         
     logging.info("[INFO] Alle Orders (Market, SL, 3xTP) wurden gesendet.")
-
-if __name__ == "__main__":
-    uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
