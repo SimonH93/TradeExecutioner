@@ -180,11 +180,12 @@ async def get_position_size(base_symbol: str, usdt_budget: float = None, leverag
     # Current Price
     price = await get_current_price(base_symbol, product_type)
     total_size_raw_desired = (usdt_budget * leverage) / price
-    total_size_raw_final = min(total_size_raw_desired, max_market_qty, max_limit_qty)
+    max_allowed_qty = min(max_market_qty, max_limit_qty)
+    total_size_raw_final = min(total_size_raw_desired, max_allowed_qty)
 
     if total_size_raw_final < total_size_raw_desired:
         logging.warning("Desired size (%.2f) reduced to max allowed size (%.2f) due to exchange limits (Market or Limit Qty).", 
-                        total_size_raw_desired, total_size_raw_final)
+                        total_size_raw_desired, total_size_raw_final, max_allowed_qty)
     
     total_size = round(total_size_raw_final, size_scale)
 
