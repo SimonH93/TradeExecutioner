@@ -309,8 +309,7 @@ async def parse_signal(text: str):
         lev_match = re.search(r"LEVERAGE:\s*x(\d+)", clean_text)
         leverage = int(lev_match.group(1)) if lev_match else None
 
-        logging.info("DEBUG:", base_symbol, position_type, entry_price, stop_loss, take_profits, leverage)
-
+        logging.info(f"DEBUG: Symbol={base_symbol}, Type={position_type}, Entry={entry_price}, SL={stop_loss}, TPs={take_profits}, Lev={leverage}")
 
         if not all([base_symbol, position_type, entry_price, stop_loss, leverage]):
             return None  # Required fields missing
