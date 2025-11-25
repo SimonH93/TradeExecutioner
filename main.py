@@ -30,25 +30,49 @@ USDT_BUDGET = float(os.getenv("BITGET_USDT_SIZE") or 10)
 DEFAULT_LEVERAGE = float(os.getenv("BITGET_LEVERAGE", 1))
 TEST_MODE = os.getenv("BITGET_TEST_MODE", "True").lower() == "true"
 
-
 # Base URL for Bitget Futures
 BASE_URL = "https://api.bitget.com"
 
 if not all([BITGET_API_KEY, BITGET_API_SECRET, BITGET_PASSWORD]):
-    raise ValueError("Mindestens ein benötigtes API Credential fehlt in .env")
+    raise ValueError("At least one required API credential is missing in .env")
+
+# Reads TP percentages from .env (e.g., TP1_PERCENT=50, TP2_PERCENT=30, etc.)
+def get_tp_config():
+    """Dynamically reads TP percentages from environment variables."""
+    tp_percentages = []
+    i = 1
+    while True:
+        key = f"TP{i}_PERCENT"
+        percent_str = os.getenv(key)
+        if percent_str is None:
+            break
+        try:
+            percent = float(percent_str)
+            if percent <= 0:
+                logging.warning(f"TP{i}_PERCENT is set to zero or less. Ignoring.")
+            else:
+                tp_percentages.append(percent / 100.0)
+        except ValueError:
+            logging.error(f"Invalid value for {key}: {percent_str}. Must be a number.")
+        i += 1
+    
+    # Fallback to a default 100% split if no TPs are defined
+    if not tp_percentages:
+        logging.warning("No TP percentages defined in .env (e.g., TP1_PERCENT). Defaulting to 100%% split at TP1.")
+        return [1.0] # 100% at TP1
+        
+    return tp_percentages
+
+TP_SPLIT_PERCENTAGES = get_tp_config()
 
 @app.get("/")
 def read_root():
     """Health Check."""
     return {"status": "Service is running", "mode": "Webhook Bot"}
 
-# NEU: Empfängt den HTTP POST vom Router-Service
+
 @app.post("/process_signal")
 async def process_router_signal(update: dict):
-    # Wichtig: Die Autorisierung ist jetzt implizit, da nur der Router senden soll
-    # Ihre Autorisierungs- und Filterlogik muss hier eventuell entfernt/vereinfacht werden.
-    
-    # 1. Die Nachricht aus dem Update holen (genau wie im Router)
     msg = update.get("channel_post") or update.get("message") or update.get("edited_channel_post") or update.get("edited_message")
     
     if not msg:
@@ -56,12 +80,12 @@ async def process_router_signal(update: dict):
         
     text = msg.get("text", "")
 
-    logging.info(f"Signal vom Router empfangen: {text[:50]}...")
+    logging.info(f"Signal received from router: {text[:50]}...")
     
-    # 2. Den Signal-Prozess starten
+    # Parse signal
     signal = await parse_signal(text)
     if signal:
-        logging.info("Signal erkannt: %s", signal)
+        logging.info("Signal recognized: %s", signal)
         asyncio.create_task(place_bitget_trade(signal, test_mode=TEST_MODE))
 
     return {"status": "ok"}
@@ -159,12 +183,12 @@ async def get_symbol_metadata(base_symbol: str) -> dict:
         return 4 # Fallback for errors
 
 async def get_quantity_scale(base_symbol: str) -> int:
-    """Gibt die Präzision für die Positionsgröße zurück."""
+    """Returns the precision for the position size."""
     metadata = await get_symbol_metadata(base_symbol)
     return metadata.get("sizeScale", 4)
 
 async def get_price_scale(base_symbol: str) -> int:
-    """Gibt die Präzision für den Preis zurück."""
+    """Returns the precision for the price."""
     metadata = await get_symbol_metadata(base_symbol)
     return metadata.get("priceScale", 4)
 
@@ -192,23 +216,46 @@ async def get_position_size(base_symbol: str, usdt_budget: float = None, leverag
     if total_size <= 0 and total_size_raw_desired > 0:
         logging.warning("Calculated position size %f was rounded down to 0 or below due to precision or minimum size.", total_size_raw_desired)
     
-    tp_sizes_raw_splits = [
-        total_size * 0.5,  # TP1 = 50%
-        total_size * 0.3,  # TP2 = 30%
-    ]
-    tp_sizes = [round(s, size_scale) for s in tp_sizes_raw_splits]
+    tp_split_percentages = TP_SPLIT_PERCENTAGES.copy()
 
-    tp3_size_raw = total_size - sum(tp_sizes)
-    tp3_size = round(tp3_size_raw, size_scale)
-
-    if tp3_size > 0:
-        tp_sizes.append(tp3_size)
-    else:
-        if len(tp_sizes) > 0:
-            tp_sizes[-1] = round(tp_sizes[-1] + tp3_size_raw, size_scale)
+    # Calculate the total percentage covered by the defined TPs
+    total_defined_percent = sum(tp_split_percentages)
     
-    return total_size, tp_sizes
+    # Calculate the difference from 100%
+    remaining_percent = 1.0 - total_defined_percent
+    
+    # Adjust the last TP percentage to cover the total remaining size
+    if tp_split_percentages:
+        tp_split_percentages[-1] += remaining_percent
+        logging.info(
+            "[TP SPLIT] Defined percentages sum to %.2f%%. Adjusted last TP (%.2f%%) to cover the remaining %.2f%%.",
+            total_defined_percent * 100, 
+            tp_split_percentages[-1] * 100,
+            remaining_percent * 100
+        )
+    
+    # Calculate sizes based on the adjusted percentages
+    tp_sizes = []
+    current_remainder = total_size
+    
+    for i, percent in enumerate(tp_split_percentages):
+        if i == len(tp_split_percentages) - 1:
+            # For the last element, use the remainder of the total size 
+            # to prevent cumulative rounding errors from fractional parts
+            tp_size = current_remainder
+        else:
+            tp_size_raw = total_size * percent
+            tp_size = round(tp_size_raw, size_scale)
+            current_remainder -= tp_size
+        
+        # Ensure size is not negative due to over-rounding
+        if tp_size > 0:
+            tp_sizes.append(tp_size)
+    
+    # The sum of all rounded sizes may not exactly equal the rounded total_size,
+    # but the split logic ensures the full amount is covered across the TPs.
 
+    return total_size, tp_sizes
 
 
 def validate_trade(position_type, stop_loss, take_profits, current_price):
@@ -227,7 +274,7 @@ def validate_trade(position_type, stop_loss, take_profits, current_price):
 async def parse_signal(text: str):
     
     if "POSITION SIZE" not in text.upper():  # case-insensitive check
-        print("no valid signal")
+        logging.warning("no valid signal")
         return None
     
     try:
@@ -255,14 +302,14 @@ async def parse_signal(text: str):
         take_profits = [float(tp) for tp in tp_matches if tp]
         # If TP list is empty, reject trade
         if not take_profits:
-            print("No valid TP found")
+            logging.warning("No valid TP found")
             return None
 
         # LEVERAGE
         lev_match = re.search(r"LEVERAGE:\s*x(\d+)", clean_text)
         leverage = int(lev_match.group(1)) if lev_match else None
 
-        print("DEBUG:", base_symbol, position_type, entry_price, stop_loss, take_profits, leverage)
+        logging.info("DEBUG:", base_symbol, position_type, entry_price, stop_loss, take_profits, leverage)
 
 
         if not all([base_symbol, position_type, entry_price, stop_loss, leverage]):
@@ -271,11 +318,11 @@ async def parse_signal(text: str):
         current_price = await get_current_price(base_symbol)
         # Calculate position + TP split
         position_size, tp_sizes = await get_position_size(base_symbol, leverage=leverage)
-        print(f"[DEBUG] Total position size: {position_size}, TP split sizes: {tp_sizes}")
+        logging.info(f"[DEBUG] Total position size: {position_size}, TP split sizes: {tp_sizes}")
 
 
         if not validate_trade(position_type, stop_loss, take_profits, current_price):
-            print(f"[DEBUG] Current={current_price}, SL={stop_loss}, TP_min={min(take_profits)}, TP_max={max(take_profits)}")
+            logging.info(f"[DEBUG] Current={current_price}, SL={stop_loss}, TP_min={min(take_profits)}, TP_max={max(take_profits)}")
             return None        
         
         return {
@@ -289,7 +336,7 @@ async def parse_signal(text: str):
             "leverage": leverage
         }
     except Exception as e:
-        print("Parsing Error:", e)
+        logging.error("Parsing Error:", e)
     
     return None
 
@@ -339,7 +386,7 @@ async def set_leverage(symbol: str, leverage: int, margin_mode: str = "isolated"
                 logging.error("[ERROR] Bitget API response (Set Leverage failed): %s (Payload: %s)", data, payload)
                 return False
             
-            logging.info(f"[SUCCESS] Leverage erfolgreich auf x{leverage} für {symbol} gesetzt.")
+            logging.info(f"[SUCCESS] Leverage successfully set to x{leverage} for {symbol}.")
             return True
             
     except httpx.RequestException as e:
@@ -348,7 +395,7 @@ async def set_leverage(symbol: str, leverage: int, margin_mode: str = "isolated"
 
 async def place_market_order(symbol, size, side, leverage=10, retry_count=0):
     if retry_count >= 3:
-        logging.error("Markt Order after %d tries failed. Trade cancelled.", retry_count)
+        logging.error("Market Order after %d tries failed. Trade cancelled.", retry_count)
         return None
     
     url_path = "/api/mix/v1/order/placeOrder"
@@ -358,9 +405,9 @@ async def place_market_order(symbol, size, side, leverage=10, retry_count=0):
     payload = {
         "symbol": symbol,
         "size": str(size),
-        "side": side,             # "buy" oder "sell"
+        "side": side,          # "open_long" or "open_short"
         "orderType": "market",
-        "marginMode": "isolated",  # Isolated margin mode
+        "marginMode": "isolated", 
         "productType": "UMCBL",
         "leverage": str(leverage),
         "marginCoin": "USDT"
@@ -377,37 +424,72 @@ async def place_market_order(symbol, size, side, leverage=10, retry_count=0):
     }
 
     try:
-         # Use httpx.AsyncClient for non-blocking requests
+        # Use httpx.AsyncClient for non-blocking requests
         async with httpx.AsyncClient(timeout=5) as client:
             resp = await client.post(url, headers=headers, data=body)
         
         if resp.status_code >= 400:
             error_data = resp.json()
-            if error_data.get("code") == "40921":
+            error_code = error_data.get("code")
+            error_msg = error_data.get("msg", "")
+
+            # --- DIRECT LIMIT EXTRACTION FOR SIZE ERRORS 45133---
+            new_size = None
+            
+            # Error code 45133: Exceeded the maximum quantity of contract orders: XXXXX ZK
+            if error_code == "45133": 
+                # RegEx: Extract a number group (with or without comma/dot) from the string
+                limit_match = re.search(r"contract orders: ([\d,.]+)", error_msg)
                 
-                # Strategy: Reduce size in 5% steps and try again
-                new_size_raw = size * 0.95 
-                # Wichtig: Holen Sie die Präzision (Scale) für die korrekte Rundung
+                if limit_match:
+                    # Clean the string (remove commas) and try to parse the float
+                    limit_str = limit_match.group(1).replace(",", "")
+                    try:
+                        # Set the new size to the limit reported by the server
+                        max_allowed_size = float(limit_str) 
+                        
+                        # Use 99.9% of the reported limit to avoid rounding issues
+                        new_size_raw = max_allowed_size * 0.999 
+                        
+                        base_symbol = symbol.replace("_UMCBL", "")
+                        metadata = await get_symbol_metadata(base_symbol)
+                        size_scale = metadata.get("sizeScale", 0) 
+                        new_size = round(new_size_raw, size_scale)
+                        
+                        logging.warning(
+                            "[LIMIT FIXED 45133] Desired size (%.2f) exceeded limit. Setting order size to max allowed (%.2f).", 
+                            size, new_size
+                        )
+
+                    except ValueError:
+                        logging.error("Failed to parse numeric limit from error message: %s. Falling back to 5%% reduction.", limit_str)
+                        # Fallback if parsing fails: Reduce by 5%
+                        new_size = round(size * 0.95, size_scale)
+
+            # Error code 40921: Position-level limit (use the 5% reduction fallback)
+            elif error_code == "40921":
+                # Get the precision (Scale) for correct rounding
                 base_symbol = symbol.replace("_UMCBL", "")
                 metadata = await get_symbol_metadata(base_symbol)
                 size_scale = metadata.get("sizeScale", 0) 
                 
+                new_size_raw = size * 0.95
                 new_size = round(new_size_raw, size_scale)
                 
                 logging.warning(
-                    "[RETRY 40921] Size %s exceeds positions-level-limit. Try with reduced order size (%.2f%%): %s", 
-                    size, 
-                    (1 - 0.95) * 100,
+                    "[RETRY 40921] Size exceeds positions-level-limit. Trying with reduced order size (5%%): %s", 
                     new_size
                 )
-                # Recursive call with smaller size
-                return await place_market_order(symbol, new_size, side, leverage, retry_count + 1)
-                
-            else:
-                # Check other 4xx/5xx errors
-                logging.error("[ERROR 4xx/5xx MARKET ORDER] Bitget API Status Code %d. Response Body: %s (Payload: %s)", 
-                              resp.status_code, error_data, payload)
-                return None
+            
+            # Check if we calculated a new size (i.e., error was 45133 or 40921)
+            if new_size is not None and new_size > 0:
+                 return await place_market_order(symbol, new_size, side, leverage, retry_count + 1)
+            
+            # Otherwise: Log the error and cancel
+            logging.error("[ERROR 4xx/5xx MARKET ORDER] Bitget API Status Code %d (Code: %s). Response Body: %s (Payload: %s)", 
+                          resp.status_code, error_code, error_data, payload)
+            return None
+
 
         data = resp.json() 
         if data.get("code") != "00000":
@@ -418,14 +500,14 @@ async def place_market_order(symbol, size, side, leverage=10, retry_count=0):
         # Catches network errors or timeouts
         logging.error("[ERROR] Market Order Request failed (network/timeout): %s", e)
         return None
-
+    
 async def place_conditional_order(symbol, size, trigger_price, side: str, is_sl: bool):
     url_path = "/api/mix/v1/plan/placePlan" 
     url = f"{BASE_URL}{url_path}"
     timestamp = str(int(time.time() * 1000))
 
     if side not in ["close_long", "close_short"]:
-        logging.error("Ungültiger Side für Conditional Order: %s. Erwarte 'close_long' oder 'close_short'.", side)
+        logging.error("Invalid side for Conditional Order: %s. Expected 'close_long' or 'close_short'.", side)
         return None
 
     base_symbol = symbol.replace("_UMCBL", "")
@@ -513,7 +595,7 @@ async def place_bitget_trade(signal, test_mode=True):
         closing_side = "close_short"   # Closes SHORT position
     
     if test_mode:
-        logging.info("[TEST MODE] Market Order, SL und TP Orders werden nicht gesendet")
+        logging.info("[TEST MODE] Market Order, SL and TP Orders will not be sent")
         return
 
     # Set explicit Leverage for pair
@@ -521,21 +603,30 @@ async def place_bitget_trade(signal, test_mode=True):
         base_symbol_for_leverage = symbol.replace("_UMCBL", "")
         leverage_set = await set_leverage(symbol=base_symbol_for_leverage, leverage=leverage, margin_mode="isolated")
         if not leverage_set:
-            logging.error("Konnte Leverage nicht setzen. Trade wird abgebrochen.")
+            logging.error("Could not set leverage. Trade will be aborted.")
             return
 
+    num_splits = len(tp_sizes)
+    if len(tp_prices) > num_splits:
+        logging.warning("More TP prices found in signal (%d) than defined splits in .env (%d). Ignoring the extra TP prices.", 
+                        len(tp_prices), num_splits)
+        tp_prices = tp_prices[:num_splits]
+    elif len(tp_prices) < num_splits:
+        logging.error("Too few TP prices found in signal (%d) for the defined splits in .env (%d). The remaining position size will not be protected by a TP. Aborting TP orders.",
+                      len(tp_prices), num_splits)
+        return
 
     # --- 1. Place Market Order ---
     market_order_resp = await place_market_order(symbol, position_size, side=market_side_open, leverage=leverage)
     logging.info("Market Order Response: %s", market_order_resp)
 
     if not market_order_resp:
-        logging.error("Konnte Market Order nicht platzieren. SL/TP Orders werden abgebrochen.")
+        logging.error("Could not place Market Order. SL/TP Orders will be aborted.")
         return
     
     # Wait for order execution
-    logging.info("[INFO] Warte 3.0 Sekunden (nicht-blockierend) zur Sicherheit.")
-    await asyncio.sleep(3.0)
+    logging.info("[INFO] Waiting 2 seconds (non-blocking) for safety.")
+    await asyncio.sleep(2.0)
 
     # --- 2. Stop-Loss Order ---
     sl_resp = await place_conditional_order(
@@ -560,4 +651,4 @@ async def place_bitget_trade(signal, test_mode=True):
         )
         logging.info(f"TP{i+1} Plan order (Price: {tp_price}, Size: {tp_size}) Response: %s", tp_resp)
         
-    logging.info("[INFO] Alle Orders (Market, SL, 3xTP) wurden gesendet.")
+    logging.info("[INFO] All orders (Market, SL, 3xTP) have been sent.")
