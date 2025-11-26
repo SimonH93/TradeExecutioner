@@ -242,7 +242,7 @@ async def get_position_size(base_symbol: str, usdt_budget: float = None, leverag
         if i == len(tp_split_percentages) - 1:
             # For the last element, use the remainder of the total size 
             # to prevent cumulative rounding errors from fractional parts
-            tp_size = current_remainder
+            tp_size = round(current_remainder, size_scale)
         else:
             tp_size_raw = total_size * percent
             tp_size = round(tp_size_raw, size_scale)
@@ -393,7 +393,7 @@ async def set_leverage(symbol: str, leverage: int, margin_mode: str = "isolated"
         return False
 
 async def place_market_order(symbol, size, side, leverage=10, retry_count=0):
-    if retry_count >= 3:
+    if retry_count >= 6:
         logging.error("Market Order after %d tries failed. Trade cancelled.", retry_count)
         return None
     
@@ -462,17 +462,17 @@ async def place_market_order(symbol, size, side, leverage=10, retry_count=0):
 
                     except ValueError:
                         logging.error("Failed to parse numeric limit from error message: %s. Falling back to 5%% reduction.", limit_str)
-                        # Fallback if parsing fails: Reduce by 5%
-                        new_size = round(size * 0.95, size_scale)
+                        # Fallback if parsing fails: Reduce by 10%
+                        new_size = round(size * 0.80, size_scale)
 
-            # Error code 40921: Position-level limit (use the 5% reduction fallback)
+            # Error code 40921: Position-level limit (use the 10% reduction fallback)
             elif error_code == "40921":
                 # Get the precision (Scale) for correct rounding
                 base_symbol = symbol.replace("_UMCBL", "")
                 metadata = await get_symbol_metadata(base_symbol)
                 size_scale = metadata.get("sizeScale", 0) 
                 
-                new_size_raw = size * 0.95
+                new_size_raw = size * 0.80
                 new_size = round(new_size_raw, size_scale)
                 
                 logging.warning(
