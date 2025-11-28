@@ -524,10 +524,23 @@ async def place_conditional_order(symbol, size, trigger_price, side: str, is_sl:
     original_price_scale = await get_price_scale(base_symbol)
     max_allowed_scale = 4
     trigger_price_scale = min(original_price_scale, max_allowed_scale)
-    rounded_price = round(trigger_price, min(await get_price_scale(base_symbol), 4))
-    order_type = "limit"
+    rounded_trigger_price = round(trigger_price, min(original_price_scale, 4))
+    
+    if is_sl:
+        # Stop-Loss: OrderType ist MARKET
+        order_type = "market"
+        # Bei Market Orders wird kein price (Ausführungspreis) im Payload gesendet.
+        execution_price = None 
+        logging.info(f"[SL-MARKET] Trigger Price: {rounded_trigger_price}. Execution: MARKET.")
+    else:
+        # Take-Profit: OrderType ist LIMIT
+        order_type = "limit"
+        # Bei Limit Orders ist der Ausführungspreis gleich dem Trigger-Preis
+        execution_price = rounded_trigger_price 
+        logging.info(f"[TP-LIMIT] Trigger Price: {rounded_trigger_price}. Execution Price: {execution_price}.")
+    
 
-    logging.info(f"[DEBUG] Applying price rounding: Original={trigger_price}, Instrument Scale={original_price_scale}, Trigger Scale ={trigger_price_scale}, Rounded={rounded_price}")
+    logging.info(f"[DEBUG] Applying price rounding: Original={trigger_price}, Instrument Scale={original_price_scale}, Trigger Scale ={trigger_price_scale}, Rounded={rounded_trigger_price}")
 
 
     payload = {
@@ -541,10 +554,12 @@ async def place_conditional_order(symbol, size, trigger_price, side: str, is_sl:
         "planType": "normal_plan",
         "tradeSide": "close",
         "reduceOnly": "yes",
-        "price": str(rounded_price),
-        "triggerPrice": str(rounded_price),
+        "triggerPrice": str(rounded_trigger_price),
         "triggerType": "mark_price",
     }
+
+    if execution_price is not None:
+         payload["price"] = str(execution_price)
     
     body = json.dumps(payload)
     signature = sign_request("POST", url_path, timestamp, body)
