@@ -525,26 +525,9 @@ async def place_conditional_order(symbol, size, trigger_price, side: str, is_sl:
     max_allowed_scale = 4
     trigger_price_scale = min(original_price_scale, max_allowed_scale)
     rounded_price = round(trigger_price, min(await get_price_scale(base_symbol), 4))
-    
+    order_type = "limit"
+
     logging.info(f"[DEBUG] Applying price rounding: Original={trigger_price}, Instrument Scale={original_price_scale}, Trigger Scale ={trigger_price_scale}, Rounded={rounded_price}")
-
-
-    # SL should be Market, TP should be Limit
-    order_type = "market" if is_sl else "limit"
-    if order_type == "market":
-        price_value = "" 
-    else:
-        price_value = str(rounded_price)
-    logging.info(f"[DEBUG] Conditional Order: Type={order_type}, Price='{price_value}'")
-
-    if is_sl:
-        # SL must be a Market order to ensure execution.
-        order_type = "market" 
-        logging.info("[DEBUG] Conditional Order: Setting SL as Market Order.")
-    else:
-        # TP is a Limit Order with the TP price as the limit price
-        order_type = "limit"
-        logging.info("[DEBUG] Conditional Order: Setting TP as Limit Order.")
 
 
     payload = {
@@ -558,7 +541,7 @@ async def place_conditional_order(symbol, size, trigger_price, side: str, is_sl:
         "planType": "normal_plan",
         "tradeSide": "close",
         "reduceOnly": "yes",
-        "price": price_value,
+        "price": str(rounded_price),
         "triggerPrice": str(rounded_price),
         "triggerType": "mark_price",
     }
