@@ -417,7 +417,8 @@ async def place_market_order(symbol, size, side, leverage=10, retry_count=0):
         "side": v2_side,
         "posSide": v2_pos_side,
         "orderType": "market",
-        "marginMode": "isolated", 
+        "marginMode": "isolated",
+        "marginCoin": "USDT",
         "productType": "UMCBL"
     }
     body = json.dumps(payload)
