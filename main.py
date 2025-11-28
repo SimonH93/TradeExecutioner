@@ -532,20 +532,18 @@ async def place_conditional_order(symbol, size, trigger_price, side: str, is_sl:
     # SL should be Market, TP should be Limit
     order_type = "market" if is_sl else "limit"
     if order_type == "market":
-        price_value = "" # Laut Doku: "It must be empty when orderType is market."
+        price_value = "" 
     else:
-        price_value = str(rounded_price) # Laut Doku: "it is required when orderType is limit"
+        price_value = str(rounded_price)
     logging.info(f"[DEBUG] Conditional Order: Type={order_type}, Price='{price_value}'")
 
     if is_sl:
         # SL must be a Market order to ensure execution.
         order_type = "market" 
-        entrust_price = "0" # Or omit, but 0 is safer
         logging.info("[DEBUG] Conditional Order: Setting SL as Market Order.")
     else:
         # TP is a Limit Order with the TP price as the limit price
         order_type = "limit"
-        entrust_price = str(rounded_price) # DThe price at which the order should be executed (limit price)
         logging.info("[DEBUG] Conditional Order: Setting TP as Limit Order.")
 
 
