@@ -415,7 +415,7 @@ async def place_market_order(symbol, size, side, leverage=10, retry_count=0):
         "side": v2_side,
         "tradeSide": "open",
         "orderType": "market",
-        "marginMode": "isolated",
+        "marginMode": "crossed",
         "marginCoin": "USDT",
         "productType": "UMCBL"
     }
