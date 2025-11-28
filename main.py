@@ -403,10 +403,8 @@ async def place_market_order(symbol, size, side, leverage=10, retry_count=0):
 
     if side == "open_long":
         v2_side = "buy"  # Kaufen, um Long zu eröffnen
-        v2_pos_side = "long"
     elif side == "open_short":
         v2_side = "sell" # Verkaufen, um Short zu eröffnen
-        v2_pos_side = "short"
     else:
         logging.error("Invalid side passed to place_market_order: %s", side)
         return None
@@ -545,7 +543,7 @@ async def place_conditional_order(symbol, size, trigger_price, side: str, is_sl:
 
 
     payload = {
-        "symbol": symbol,
+        "symbol": base_symbol,
         "size": str(size),
         "side": v2_side,
         "orderType": order_type,
