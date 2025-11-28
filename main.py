@@ -509,7 +509,7 @@ async def place_market_order(symbol, size, side, leverage=10, retry_count=0):
         return None
     
 async def place_conditional_order(symbol, size, trigger_price, side: str, is_sl: bool):
-    url_path = "/api/v2/mix/plan/place-plan"
+    url_path = "/api/v2/mix/order/place-plan-order"
     url = f"{BASE_URL}{url_path}"
     timestamp = str(int(time.time() * 1000))
     if side == "close_long":
@@ -547,7 +547,7 @@ async def place_conditional_order(symbol, size, trigger_price, side: str, is_sl:
         "symbol": base_symbol,
         "size": str(size),
         "side": v2_side,
-        "tradeSide": "open",
+        "tradeSide": "close",
         "orderType": order_type,
         "productType": "UMCBL",
         "marginCoin": "USDT",
