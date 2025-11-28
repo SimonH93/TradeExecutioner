@@ -513,9 +513,9 @@ async def place_conditional_order(symbol, size, trigger_price, side: str, is_sl:
     url = f"{BASE_URL}{url_path}"
     timestamp = str(int(time.time() * 1000))
     if side == "close_long":
-        v2_side = "sell"
-    elif side == "close_short":
         v2_side = "buy"
+    elif side == "close_short":
+        v2_side = "sell"
     else:
         logging.error("Invalid side for Conditional Order: %s. Expected 'close_long' or 'close_short'.", side)
         return None
