@@ -549,6 +549,7 @@ async def place_conditional_order(symbol, size, trigger_price, side: str, is_sl:
         "side": v2_side,
         "tradeSide": "close",
         "orderType": order_type,
+        "planType": "normal_plan",
         "productType": "UMCBL",
         "marginCoin": "USDT",
         "triggerPrice": str(rounded_price),
