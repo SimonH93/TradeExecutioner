@@ -524,13 +524,19 @@ async def place_conditional_order(symbol, size, trigger_price, side: str, is_sl:
     original_price_scale = await get_price_scale(base_symbol)
     max_allowed_scale = 4
     trigger_price_scale = min(original_price_scale, max_allowed_scale)
-    rounded_price = round(trigger_price, trigger_price_scale)
+    rounded_price = round(trigger_price, min(await get_price_scale(base_symbol), 4))
     
     logging.info(f"[DEBUG] Applying price rounding: Original={trigger_price}, Instrument Scale={original_price_scale}, Trigger Scale ={trigger_price_scale}, Rounded={rounded_price}")
 
 
     # SL should be Market, TP should be Limit
     order_type = "market" if is_sl else "limit"
+    if order_type == "market":
+        price_value = "" # Laut Doku: "It must be empty when orderType is market."
+    else:
+        price_value = str(rounded_price) # Laut Doku: "it is required when orderType is limit"
+    logging.info(f"[DEBUG] Conditional Order: Type={order_type}, Price='{price_value}'")
+
     if is_sl:
         # SL must be a Market order to ensure execution.
         order_type = "market" 
@@ -545,17 +551,18 @@ async def place_conditional_order(symbol, size, trigger_price, side: str, is_sl:
 
     payload = {
         "symbol": base_symbol,
+        "productType": "UMCBL",
+        "marginMode": "isolated",
+        "marginCoin": "USDT",
         "size": str(size),
-        "side": v2_side,
-        "tradeSide": "close",
+        "side": v2_side, 
         "orderType": order_type,
         "planType": "normal_plan",
-        "productType": "UMCBL",
-        "marginCoin": "USDT",
+        "tradeSide": "close",
+        "reduceOnly": "yes",
+        "price": price_value,
         "triggerPrice": str(rounded_price),
         "triggerType": "mark_price",
-        "executePrice": entrust_price,
-        "timeInForce": "gtc"
     }
     
     body = json.dumps(payload)
