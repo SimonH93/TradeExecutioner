@@ -415,7 +415,6 @@ async def place_market_order(symbol, size, side, leverage=10, retry_count=0):
         "symbol": symbol.replace("_UMCBL", ""),
         "size": str(size),
         "side": v2_side,
-        "posSide": v2_pos_side,
         "orderType": "market",
         "marginMode": "isolated",
         "marginCoin": "USDT",
@@ -516,10 +515,8 @@ async def place_conditional_order(symbol, size, trigger_price, side: str, is_sl:
     timestamp = str(int(time.time() * 1000))
     if side == "close_long":
         v2_side = "sell"
-        v2_pos_side = "long"
     elif side == "close_short":
         v2_side = "buy"
-        v2_pos_side = "short"
     else:
         logging.error("Invalid side for Conditional Order: %s. Expected 'close_long' or 'close_short'.", side)
         return None
@@ -551,7 +548,6 @@ async def place_conditional_order(symbol, size, trigger_price, side: str, is_sl:
         "symbol": symbol,
         "size": str(size),
         "side": v2_side,
-        "posSide": v2_pos_side,
         "orderType": order_type,
         "productType": "UMCBL",
         "marginCoin": "USDT",
