@@ -397,19 +397,28 @@ async def place_market_order(symbol, size, side, leverage=10, retry_count=0):
         logging.error("Market Order after %d tries failed. Trade cancelled.", retry_count)
         return None
     
-    url_path = "/api/mix/v1/order/placeOrder"
+    url_path = "/api/v2/mix/order/place-order"
     url = f"{BASE_URL}{url_path}"
     timestamp = str(int(time.time() * 1000))
+
+    if side == "open_long":
+        v2_side = "buy"  # Kaufen, um Long zu eröffnen
+        v2_pos_side = "long"
+    elif side == "open_short":
+        v2_side = "sell" # Verkaufen, um Short zu eröffnen
+        v2_pos_side = "short"
+    else:
+        logging.error("Invalid side passed to place_market_order: %s", side)
+        return None
 
     payload = {
         "symbol": symbol,
         "size": str(size),
-        "side": side,          # "open_long" or "open_short"
+        "side": v2_side,
+        "posSide": v2_pos_side,
         "orderType": "market",
         "marginMode": "isolated", 
-        "productType": "UMCBL",
-        "leverage": str(leverage),
-        "marginCoin": "USDT"
+        "productType": "UMCBL"
     }
     body = json.dumps(payload)
     signature = sign_request("POST", url_path, timestamp, body)
@@ -461,7 +470,7 @@ async def place_market_order(symbol, size, side, leverage=10, retry_count=0):
                         )
 
                     except ValueError:
-                        logging.error("Failed to parse numeric limit from error message: %s. Falling back to 5%% reduction.", limit_str)
+                        logging.error("Failed to parse numeric limit from error message: %s. Falling back to 20%% reduction.", limit_str)
                         # Fallback if parsing fails: Reduce by 10%
                         new_size = round(size * 0.80, size_scale)
 
@@ -501,19 +510,26 @@ async def place_market_order(symbol, size, side, leverage=10, retry_count=0):
         return None
     
 async def place_conditional_order(symbol, size, trigger_price, side: str, is_sl: bool):
-    url_path = "/api/mix/v1/plan/placePlan" 
+    url_path = "/api/v2/mix/plan/place-plan"
     url = f"{BASE_URL}{url_path}"
     timestamp = str(int(time.time() * 1000))
-
-    if side not in ["close_long", "close_short"]:
+    if side == "close_long":
+        v2_side = "sell"
+        v2_pos_side = "long"
+    elif side == "close_short":
+        v2_side = "buy"
+        v2_pos_side = "short"
+    else:
         logging.error("Invalid side for Conditional Order: %s. Expected 'close_long' or 'close_short'.", side)
         return None
 
     base_symbol = symbol.replace("_UMCBL", "")
-    price_scale = await get_price_scale(base_symbol)
-    rounded_price = round(trigger_price, price_scale)
+    original_price_scale = await get_price_scale(base_symbol)
+    max_allowed_scale = 4
+    trigger_price_scale = min(original_price_scale, max_allowed_scale)
+    rounded_price = round(trigger_price, trigger_price_scale)
     
-    logging.info(f"[DEBUG] Applying price rounding: Original={trigger_price}, Scale={price_scale}, Rounded={rounded_price}")
+    logging.info(f"[DEBUG] Applying price rounding: Original={trigger_price}, Instrument Scale={original_price_scale}, Trigger Scale ={trigger_price_scale}, Rounded={rounded_price}")
 
 
     # SL should be Market, TP should be Limit
@@ -533,13 +549,15 @@ async def place_conditional_order(symbol, size, trigger_price, side: str, is_sl:
     payload = {
         "symbol": symbol,
         "size": str(size),
-        "side": side,
+        "side": v2_side,
+        "posSide": v2_pos_side,
         "orderType": order_type,
         "productType": "UMCBL",
         "marginCoin": "USDT",
         "triggerPrice": str(rounded_price),
         "triggerType": "mark_price",
-        "executePrice": entrust_price
+        "executePrice": entrust_price,
+        "timeInForce": "gtc"
     }
     
     body = json.dumps(payload)
