@@ -412,7 +412,7 @@ async def place_market_order(symbol, size, side, leverage=10, retry_count=0):
         return None
 
     payload = {
-        "symbol": symbol,
+        "symbol": symbol.replace("_UMCBL", ""),
         "size": str(size),
         "side": v2_side,
         "posSide": v2_pos_side,
