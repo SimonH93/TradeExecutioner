@@ -418,7 +418,7 @@ async def parse_signal(text: str):
             return None
 
         # LEVERAGE
-        lev_match = re.search(r"LEVERAGE:\s*x(\d+)", clean_text)
+        lev_match = re.search(r"LEVERAGE:\s*[^a-zA-Z\d]*(\d+)", clean_text)
         leverage = int(lev_match.group(1)) if lev_match else None
 
         logging.info(f"DEBUG: Symbol={base_symbol}, Type={position_type}, Entry={entry_price}, SL={stop_loss}, TPs={take_profits}, Lev={leverage}")
