@@ -8,10 +8,15 @@ import uvicorn
 import os
 import re
 import time
+import contextlib
 
 import httpx
 from dotenv import load_dotenv
 from fastapi import FastAPI, Request, HTTPException
+from sqlalchemy import create_engine, Column, Integer, String, Float, DateTime, Boolean
+from sqlalchemy.orm import sessionmaker
+from sqlalchemy.ext.declarative import declarative_base
+from datetime import datetime
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 
@@ -20,6 +25,12 @@ load_dotenv()
 
 # Cache for symbol information (Precision, Min Size, etc.)
 SYMBOL_INFO_CACHE = {} 
+
+# Get User-Key for Postgres DB
+BOT_USER_KEY = os.getenv("BOT_USER_KEY")
+if not BOT_USER_KEY:
+    logging.warning("BOT_USER_KEY environment variable is missing. Database entries will have a default key.")
+    BOT_USER_KEY = "DEFAULT_USER"
 
 # Read API Keys
 BITGET_API_KEY = os.getenv("BITGET_API_KEY")
@@ -65,6 +76,69 @@ def get_tp_config():
 
 TP_SPLIT_PERCENTAGES = get_tp_config()
 
+DATABASE_URL = os.getenv("DATABASE_URL")
+
+if DATABASE_URL:
+    # Die DB-URL von Railway ist synchron, wir benötigen aber eine asynchrone Session. 
+    # Für einfache Schreibvorgänge verwenden wir den synchrone Engine/async Session-Mix von asyncpg/SQLAlchemy
+    # Beachten Sie, dass Sie für erweiterte async-Features ggf. SQLAlchemy 2.0+ und das asyncio-Backend benötigen.
+    # Hier verwenden wir den synchronen connect, der in der async-Funktion läuft.
+    Engine = create_engine(DATABASE_URL, pool_pre_ping=True)
+    Base = declarative_base()
+    SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=Engine)
+
+    class TradingSignal(Base):
+        __tablename__ = "trading_signals"
+
+        id = Column(Integer, primary_key=True, index=True)
+        user_key = Column(String, index=True, nullable=False) 
+        
+        symbol = Column(String, index=True, nullable=False)
+        position_type = Column(String, nullable=False)
+        entry_price = Column(Float)
+        stop_loss = Column(Float)
+        leverage = Column(Integer)
+        total_size = Column(Float)
+
+        tp1_price = Column(Float, nullable=True)
+        tp2_price = Column(Float, nullable=True)
+        tp3_price = Column(Float, nullable=True)
+        tp1_reached = Column(Boolean, default=False)
+        tp2_reached = Column(Boolean, default=False)
+        tp3_reached = Column(Boolean, default=False)
+        
+        # Order-Status und Metadaten
+        market_order_placed = Column(Boolean, default=False)
+        sl_order_placed = Column(Boolean, default=False)
+        
+        # Zeitstempel der Aktion
+        timestamp = Column(DateTime, default=datetime.utcnow)
+        
+        # Optional: Die gesamte Webhook-Nachricht als String speichern, falls der Position Handler sie braucht
+        raw_signal_text = Column(String) 
+        
+        
+    def init_db():
+        """Erstellt die Tabelle, falls sie noch nicht existiert."""
+        Base.metadata.create_all(bind=Engine)
+
+    # Funktion, die am besten beim Start der Anwendung aufgerufen wird (z.B. in der main-Sektion)
+    init_db()
+
+    @contextlib.contextmanager
+    def get_db():
+        """Ein Kontextmanager für die Datenbank-Session."""
+        db = SessionLocal()
+        try:
+            yield db
+        finally:
+            db.close()
+
+    logging.info("PostgreSQL Database connection and model setup successful.")
+else:
+    logging.warning("DATABASE_URL is missing. Database persistence is disabled.")
+    get_db = None
+
 @app.get("/")
 def read_root():
     """Health Check."""
@@ -85,6 +159,7 @@ async def process_router_signal(update: dict):
     # Parse signal
     signal = await parse_signal(text)
     if signal:
+        signal["raw_text"] = text
         logging.info("Signal recognized: %s", signal)
         asyncio.create_task(place_bitget_trade(signal, test_mode=TEST_MODE))
 
@@ -257,6 +332,35 @@ async def get_position_size(base_symbol: str, usdt_budget: float = None, leverag
 
     return total_size, tp_sizes
 
+async def recalculate_tp_sizes(total_size: float, base_symbol: str) -> list[float]:
+    """Recalculates the proportional TP split sizes based on a new total position size."""
+    metadata = await get_symbol_metadata(base_symbol)
+    size_scale = metadata.get("sizeScale", 4)
+    tp_split_percentages = TP_SPLIT_PERCENTAGES.copy()
+
+    # The list TP_SPLIT_PERCENTAGES already contains the normalized percentages
+    # (e.g., [0.5, 0.3, 0.2]) including the adjustment for the remainder (see get_tp_config).
+
+    tp_sizes = []
+    current_remainder = total_size
+    
+    for i, percent in enumerate(tp_split_percentages):
+        if i == len(tp_split_percentages) - 1:
+            # For the last element, use the remainder of the total size 
+            tp_size = round(current_remainder, size_scale)
+        else:
+            tp_size_raw = total_size * percent
+            tp_size = round(tp_size_raw, size_scale)
+            current_remainder -= tp_size
+        
+        if tp_size > 0:
+            tp_sizes.append(tp_size)
+    
+    # Log the result for debugging/tracking
+    logging.info("[RECALC] Recalculated TP sizes based on new total size (%.4f): %s", total_size, tp_sizes)
+    
+    return tp_sizes
+
 
 def validate_trade(position_type, stop_loss, take_profits, current_price):
     if not take_profits:
@@ -273,7 +377,7 @@ def validate_trade(position_type, stop_loss, take_profits, current_price):
 # Parser for the signal format
 async def parse_signal(text: str):
     
-    if "POSITION SIZE" not in text.upper():  # case-insensitive check
+    if "TRADING SIGNAL ALERT" not in text.upper():  # case-insensitive check
         logging.warning("no valid signal")
         return None
     
@@ -285,9 +389,9 @@ async def parse_signal(text: str):
         base_symbol = pair.replace("/", "").upper() if pair else None 
         trading_symbol = base_symbol + "_UMCBL" if base_symbol else None
 
-        # TYPE
-        type_match = re.search(r"TYPE:\s*(LONG|SHORT)", clean_text)
-        position_type = type_match.group(1) if type_match else None
+        # SIDE
+        side_match = re.search(r"SIDE:\s*(LONG|SHORT)", clean_text)
+        position_type = side_match.group(1) if side_match else None
 
         # ENTRY
         entry_match = re.search(r"ENTRY:\s*([\d.]+)", clean_text)
@@ -298,8 +402,16 @@ async def parse_signal(text: str):
         stop_loss = float(sl_match.group(1)) if sl_match else None
 
         # TAKE PROFIT TARGETS
-        tp_matches = re.findall(r"TP\d+:\s*([\d.]+)", clean_text)
-        take_profits = [float(tp) for tp in tp_matches if tp]
+        # Seperates the TP block
+        tp_block_match = re.search(r"TAKE PROFIT TARGETS:\s*(.+?)LEVERAGE:", clean_text)
+        
+        take_profits = []
+        if tp_block_match:
+            tp_block = tp_block_match.group(1)
+            # Searches in the isolated TP-Block for the TP values
+            tp_matches = re.findall(r"TP\d+:\s*([\d.]+)", tp_block)
+            take_profits = [float(tp) for tp in tp_matches if tp]
+
         # If TP list is empty, reject trade
         if not take_profits:
             logging.warning("No valid TP found")
@@ -345,7 +457,7 @@ def sign_request(method, request_path, timestamp, body=""):
     return base64.b64encode(h.digest()).decode()
 
 # Explicitly sets the leverage for the trading pair
-async def set_leverage(symbol: str, leverage: int, margin_mode: str = "isolated"):
+async def set_leverage(symbol: str, leverage: int, margin_mode: str = "crossed"):
     url_path = "/api/v2/mix/account/set-leverage"
     url = f"{BASE_URL}{url_path}"
     timestamp = str(int(time.time() * 1000))
@@ -392,10 +504,50 @@ async def set_leverage(symbol: str, leverage: int, margin_mode: str = "isolated"
         logging.error("[ERROR] Set Leverage Request failed (network/timeout): %s", e)
         return False
 
+async def save_trade_to_db(signal: dict, market_success: bool, sl_success: bool, tp_success_list: list[bool], raw_text: str):
+    """Persistiert die Handelsdaten in der Datenbank."""
+    if not get_db:
+        return
+
+    try:
+        await asyncio.to_thread(_save_trade_sync, signal, market_success, sl_success, tp_success_list, raw_text)
+    except Exception as e:
+        logging.error("Database save failed: %s", e)
+
+def _save_trade_sync(signal: dict, market_success: bool, sl_success: bool, tp_success_list: list[bool], raw_text: str):
+    """Synchrone Funktion zum Speichern (für asyncio.to_thread)."""
+    tp_prices = signal.get("tps", [])
+    with get_db() as db:
+        db_signal = TradingSignal(
+            user_key=BOT_USER_KEY,
+            symbol=signal["symbol"],
+            position_type=signal["type"].upper(),
+            entry_price=signal["entry"],
+            stop_loss=signal["sl"],
+            leverage=signal["leverage"],
+            total_size=signal["position_size"],
+            
+            tp1_price=tp_prices[0] if len(tp_prices) > 0 else None,
+            tp2_price=tp_prices[1] if len(tp_prices) > 1 else None,
+            tp3_price=tp_prices[2] if len(tp_prices) > 2 else None,
+
+            tp1_order_placed=tp_success_list[0] if len(tp_success_list) > 0 else False,
+            tp2_order_placed=tp_success_list[1] if len(tp_success_list) > 1 else False,
+            tp3_order_placed=tp_success_list[2] if len(tp_success_list) > 2 else False,
+
+            market_order_placed=market_success,
+            sl_order_placed=sl_success,
+            raw_signal_text=raw_text
+        )
+        db.add(db_signal)
+        db.commit()
+        db.refresh(db_signal)
+        logging.info("Trade signal successfully saved to DB with ID: %d", db_signal.id)
+
 async def place_market_order(symbol, size, side, leverage=10, retry_count=0):
     if retry_count >= 6:
         logging.error("Market Order after %d tries failed. Trade cancelled.", retry_count)
-        return None
+        return None, None
     
     url_path = "/api/v2/mix/order/place-order"
     url = f"{BASE_URL}{url_path}"
@@ -407,7 +559,7 @@ async def place_market_order(symbol, size, side, leverage=10, retry_count=0):
         v2_side = "sell" # Verkaufen, um Short zu eröffnen
     else:
         logging.error("Invalid side passed to place_market_order: %s", side)
-        return None
+        return None, None
 
     payload = {
         "symbol": symbol.replace("_UMCBL", ""),
@@ -495,14 +647,15 @@ async def place_market_order(symbol, size, side, leverage=10, retry_count=0):
             # Otherwise: Log the error and cancel
             logging.error("[ERROR 4xx/5xx MARKET ORDER] Bitget API Status Code %d (Code: %s). Response Body: %s (Payload: %s)", 
                           resp.status_code, error_code, error_data, payload)
-            return None
+            return None, None
 
 
         data = resp.json() 
         if data.get("code") != "00000":
             logging.error("[ERROR] Bitget API response (Status 200, but Code != 00000): %s", data)
-            return None
-        return data
+            return None, None
+        return data, size
+    
     except httpx.RequestException as e:
         # Catches network errors or timeouts
         logging.error("[ERROR] Market Order Request failed (network/timeout): %s", e)
@@ -599,11 +752,15 @@ async def place_conditional_order(symbol, size, trigger_price, side: str, is_sl:
     
 async def place_bitget_trade(signal, test_mode=True):
     symbol = signal["symbol"]
-    position_size = signal["position_size"]
+    initial_position_size = signal["position_size"]
     tp_sizes = signal["tp_sizes"]
     leverage = signal["leverage"]
     sl_price = signal["sl"]
     tp_prices = signal["tps"]
+
+    market_success = False
+    sl_success = False
+    tp_success_list = []
 
     if signal["type"].upper() == "LONG":
         market_side_open = "open_long"
@@ -635,13 +792,36 @@ async def place_bitget_trade(signal, test_mode=True):
         return
 
     # --- 1. Place Market Order ---
-    market_order_resp = await place_market_order(symbol, position_size, side=market_side_open, leverage=leverage)
-    logging.info("Market Order Response: %s", market_order_resp)
+    market_order_resp, final_position_size = await place_market_order(symbol, initial_position_size, side=market_side_open, leverage=leverage)
+    logging.info("Market Order Response: %s, Final Position Size: %s", market_order_resp, final_position_size)
 
-    if not market_order_resp:
-        logging.error("Could not place Market Order. SL/TP Orders will be aborted.")
+    if not market_order_resp or final_position_size is None or final_position_size <= 0:
+        logging.error("Could not place Market Order or final size is zero/invalid. SL/TP Orders will be aborted.")
+        await save_trade_to_db(signal, market_success=False, sl_success=False, tp_success_list=[], raw_text=signal.get("raw_text", "N/A"))
         return
     
+    market_success = True
+    signal["position_size"] = final_position_size
+    base_symbol = symbol.replace("_UMCBL", "")
+    final_tp_sizes = await recalculate_tp_sizes(final_position_size, base_symbol)
+    signal["tp_sizes"] = final_tp_sizes
+
+    num_splits = len(final_tp_sizes)
+    if not final_tp_sizes:
+         logging.warning("Recalculated TP sizes list is empty. No TP orders will be placed.")
+    
+    if len(tp_prices) > num_splits:
+        # Hier wird final_tp_sizes verwendet, das bereits durch die Neuberechnung angepasst ist
+        logging.warning("More TP prices found in signal (%d) than defined splits in .env (%d). Ignoring the extra TP prices.", 
+                         len(tp_prices), num_splits)
+        tp_prices = tp_prices[:num_splits]
+    elif len(tp_prices) < num_splits:
+        # Dieser Fall sollte nach der Neuberechnung nicht auftreten, da die TP-Größenliste
+        # immer die Länge der TP-Definitionen aus der .env hat. Wir loggen es trotzdem.
+        logging.error("Too few TP prices found in signal (%d) for the defined splits (%d). This is unexpected.",
+                       len(tp_prices), num_splits)
+        # Wir fahren fort, um die verfügbaren TP-Orders zu platzieren
+
     # Wait for order execution
     logging.info("[INFO] Waiting 2 seconds (non-blocking) for safety.")
     await asyncio.sleep(2.0)
@@ -649,16 +829,20 @@ async def place_bitget_trade(signal, test_mode=True):
     # --- 2. Stop-Loss Order ---
     sl_resp = await place_conditional_order(
         symbol=symbol,
-        size=position_size, 
+        size=final_position_size, 
         trigger_price=sl_price,
         side=closing_side,
         is_sl=True # Marks as SL -> orderType="market"
     )
     logging.info("Stop-Loss Plan Order Response: %s", sl_resp)
+    if sl_resp:
+        sl_success = True
 
     # --- 3. Take-Profit Orders ---
     for i, (tp_price, tp_size) in enumerate(zip(tp_prices, tp_sizes)):
-        if tp_size <= 0: continue
+        if tp_size <= 0: 
+            tp_success_list.append(False)
+            continue
         
         tp_resp = await place_conditional_order(
             symbol=symbol,
@@ -667,6 +851,19 @@ async def place_bitget_trade(signal, test_mode=True):
             side=closing_side,
             is_sl=False # Marks as TP -> orderType="limit"
         )
+        success = bool(tp_resp)
+        tp_success_list.append(success)
         logging.info(f"TP{i+1} Plan order (Price: {tp_price}, Size: {tp_size}) Response: %s", tp_resp)
-        
+    
+    while len(tp_success_list) < len(TP_SPLIT_PERCENTAGES):
+        tp_success_list.append(False)
+    
+    await save_trade_to_db(
+        signal, 
+        market_success=market_success, 
+        sl_success=sl_success, 
+        tp_success_list=tp_success_list,
+        raw_text=signal.get("raw_text", "N/A")
+    )
+
     logging.info("[INFO] All orders (Market, SL, 3xTP) have been sent.")
