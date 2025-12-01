@@ -377,7 +377,7 @@ def validate_trade(position_type, stop_loss, take_profits, current_price):
 # Parser for the signal format
 async def parse_signal(text: str):
     
-    if "TRADING SIGNAL ALERT" not in text.upper():  # case-insensitive check
+    if "POSITION SIZE" not in text.upper():  # case-insensitive check
         logging.warning("no valid signal")
         return None
     
@@ -389,9 +389,9 @@ async def parse_signal(text: str):
         base_symbol = pair.replace("/", "").upper() if pair else None 
         trading_symbol = base_symbol + "_UMCBL" if base_symbol else None
 
-        # SIDE
-        side_match = re.search(r"SIDE:\s*(LONG|SHORT)", clean_text)
-        position_type = side_match.group(1) if side_match else None
+        # TYPE
+        type_match = re.search(r"TYPE:\s*(LONG|SHORT)", clean_text)
+        position_type = type_match.group(1) if type_match else None
 
         # ENTRY
         entry_match = re.search(r"ENTRY:\s*([\d.]+)", clean_text)
