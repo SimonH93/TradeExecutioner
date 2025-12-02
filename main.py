@@ -106,6 +106,9 @@ if DATABASE_URL:
         tp1_reached = Column(Boolean, default=False)
         tp2_reached = Column(Boolean, default=False)
         tp3_reached = Column(Boolean, default=False)
+        tp1_order_placed = Column(Boolean, default=False)
+        tp2_order_placed = Column(Boolean, default=False)
+        tp3_order_placed = Column(Boolean, default=False)
         
         # Order-Status und Metadaten
         market_order_placed = Column(Boolean, default=False)
