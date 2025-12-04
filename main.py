@@ -60,7 +60,7 @@ def get_tp_config():
         try:
             percent = float(percent_str)
             if percent < 0:
-                logging.error(f"Invalid value for {key}: {percent_str}. Must be non-negative. Ignoring this entry.")
+                logging.error(f"Invalid value for {key}: {percent_str}. Must be non-negative.")
                 pass
             else:
                 tp_percentages.append(percent / 100.0)
