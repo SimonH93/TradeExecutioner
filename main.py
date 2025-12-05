@@ -121,6 +121,8 @@ if DATABASE_URL:
         
         # Optional: Die gesamte Webhook-Nachricht als String speichern, falls der Position Handler sie braucht
         raw_signal_text = Column(String) 
+
+        is_active = Column(Boolean, default=False)
         
         
     def init_db():
@@ -509,17 +511,17 @@ async def set_leverage(symbol: str, leverage: int, margin_mode: str = "crossed")
         logging.error("[ERROR] Set Leverage Request failed (network/timeout): %s", e)
         return False
 
-async def save_trade_to_db(signal: dict, market_success: bool, sl_success: bool, tp_success_list: list[bool], raw_text: str):
+async def save_trade_to_db(signal: dict, market_success: bool, sl_success: bool, tp_success_list: list[bool], raw_text: str, is_active: bool):
     """Persistiert die Handelsdaten in der Datenbank."""
     if not get_db:
         return
 
     try:
-        await asyncio.to_thread(_save_trade_sync, signal, market_success, sl_success, tp_success_list, raw_text)
+        await asyncio.to_thread(_save_trade_sync, signal, market_success, sl_success, tp_success_list, raw_text, is_active)
     except Exception as e:
         logging.error("Database save failed: %s", e)
 
-def _save_trade_sync(signal: dict, market_success: bool, sl_success: bool, tp_success_list: list[bool], raw_text: str):
+def _save_trade_sync(signal: dict, market_success: bool, sl_success: bool, tp_success_list: list[bool], raw_text: str, is_active: bool):
     """Synchrone Funktion zum Speichern (für asyncio.to_thread)."""
     tp_prices = signal.get("tps", [])
     with get_db() as db:
@@ -542,7 +544,8 @@ def _save_trade_sync(signal: dict, market_success: bool, sl_success: bool, tp_su
 
             market_order_placed=market_success,
             sl_order_placed=sl_success,
-            raw_signal_text=raw_text
+            raw_signal_text=raw_text,
+            is_active=is_active
         )
         db.add(db_signal)
         db.commit()
@@ -802,7 +805,7 @@ async def place_bitget_trade(signal, test_mode=True):
 
     if not market_order_resp or final_position_size is None or final_position_size <= 0:
         logging.error("Could not place Market Order or final size is zero/invalid. SL/TP Orders will be aborted.")
-        await save_trade_to_db(signal, market_success=False, sl_success=False, tp_success_list=[], raw_text=signal.get("raw_text", "N/A"))
+        await save_trade_to_db(signal, market_success=False, sl_success=False, tp_success_list=[], raw_text=signal.get("raw_text", "N/A"), is_active=False)
         return
     
     market_success = True
@@ -868,7 +871,8 @@ async def place_bitget_trade(signal, test_mode=True):
         market_success=market_success, 
         sl_success=sl_success, 
         tp_success_list=tp_success_list,
-        raw_text=signal.get("raw_text", "N/A")
+        raw_text=signal.get("raw_text", "N/A"),
+        is_active=True
     )
 
     logging.info("[INFO] All orders (Market, SL, 3xTP) have been sent.")
