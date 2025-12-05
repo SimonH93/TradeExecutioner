@@ -51,23 +51,26 @@ if not all([BITGET_API_KEY, BITGET_API_SECRET, BITGET_PASSWORD]):
 def get_tp_config():
     """Dynamically reads TP percentages from environment variables."""
     tp_percentages = []
+    max_tp_count = 3
     i = 1
-    while True:
+    for i in range(1, max_tp_count + 1):
         key = f"TP{i}_PERCENT"
         percent_str = os.getenv(key)
         if percent_str is None:
-            break
+            logging.error(f"Required environment variable {key} is missing. Assuming 0%% for this TP.")
+            tp_percentages.append(0.0)
+            continue
         try:
             percent = float(percent_str)
             if percent < 0:
                 logging.error(f"Invalid value for {key}: {percent_str}. Must be non-negative.")
-                pass
+                tp_percentages.append(0.0)
             else:
                 tp_percentages.append(percent / 100.0)
 
         except ValueError:
             logging.error(f"Invalid value for {key}: {percent_str}. Must be a number.")
-        i += 1
+            tp_percentages.append(0.0)
     
     # Fallback to a default 100% split if no TPs are defined
     if not tp_percentages:
@@ -298,44 +301,46 @@ async def get_position_size(base_symbol: str, usdt_budget: float = None, leverag
     if total_size <= 0 and total_size_raw_desired > 0:
         logging.warning("Calculated position size %f was rounded down to 0 or below due to precision or minimum size.", total_size_raw_desired)
     
-    tp_split_percentages = TP_SPLIT_PERCENTAGES.copy()
+    tp_split_percentages_raw = TP_SPLIT_PERCENTAGES.copy()
 
     # Calculate the total percentage covered by the defined TPs
-    total_defined_percent = sum(tp_split_percentages)
-    
-    # Calculate the difference from 100%
+    total_defined_percent = sum([p for p in tp_split_percentages_raw if p > 0])
     remaining_percent = 1.0 - total_defined_percent
-    
-    # Adjust the last TP percentage to cover the total remaining size
-    if tp_split_percentages:
-        tp_split_percentages[-1] += remaining_percent
+    last_valid_tp_index = -1
+    for i in range(len(tp_split_percentages_raw) - 1, -1, -1):
+        if tp_split_percentages_raw[i] > 0:
+            last_valid_tp_index = i
+            break
+
+    if last_valid_tp_index != -1 and remaining_percent > 0:
+        tp_split_percentages_raw[last_valid_tp_index] += remaining_percent
         logging.info(
-            "[TP SPLIT] Defined percentages sum to %.2f%%. Adjusted last TP (%.2f%%) to cover the remaining %.2f%%.",
+            "[TP SPLIT] Defined percentages sum to %.2f%%. Adjusted last defined TP (Index %d) to cover the remaining %.2f%%.",
             total_defined_percent * 100, 
-            tp_split_percentages[-1] * 100,
+            last_valid_tp_index + 1,
             remaining_percent * 100
         )
     
-    # Calculate sizes based on the adjusted percentages
-    tp_sizes = []
-    current_remainder = total_size
-    
-    for i, percent in enumerate(tp_split_percentages):
-        if i == len(tp_split_percentages) - 1:
-            # For the last element, use the remainder of the total size 
-            # to prevent cumulative rounding errors from fractional parts
-            tp_size = round(current_remainder, size_scale)
-        else:
-            tp_size_raw = total_size * percent
-            tp_size = round(tp_size_raw, size_scale)
-            current_remainder -= tp_size
+    tp_sizes_raw = []
+    current_remainder = total_size # 'total_size' wurde bereits früher berechnet
         
-        # Ensure size is not negative due to over-rounding
-        if tp_size > 0:
-            tp_sizes.append(tp_size)
-    
-    # The sum of all rounded sizes may not exactly equal the rounded total_size,
-    # but the split logic ensures the full amount is covered across the TPs.
+    for i, percent in enumerate(tp_split_percentages_raw):
+        tp_size = 0.0
+        
+        # Nur für Anteile > 0 eine Größe berechnen
+        if percent > 0:
+            if i == len(tp_split_percentages_raw) - 1:
+                # Für das letzte Element (letzter TP) den Rest der Gesamtgröße verwenden (wegen Rundungsfehlern)
+                tp_size = round(current_remainder, size_scale)
+            else:
+                tp_size_raw = total_size * percent
+                tp_size = round(tp_size_raw, size_scale)
+                current_remainder -= tp_size
+        
+        # Wichtig: Wir speichern 0-Größen im Roh-Array, um die Länge von tp_split_percentages_raw beizubehalten
+        tp_sizes_raw.append(tp_size)
+
+    tp_sizes = [size for size in tp_sizes_raw if size > 0]
 
     return total_size, tp_sizes
 
@@ -412,17 +417,28 @@ async def parse_signal(text: str):
         # Seperates the TP block
         tp_block_match = re.search(r"TAKE PROFIT TARGETS:\s*(.+?)LEVERAGE:", clean_text)
         
-        take_profits = []
+        signal_tp_prices = []
         if tp_block_match:
             tp_block = tp_block_match.group(1)
             # Searches in the isolated TP-Block for the TP values
             tp_matches = re.findall(r"TP\d+:\s*([\d.]+)", tp_block)
-            take_profits = [float(tp) for tp in tp_matches if tp]
+            signal_tp_prices = [float(tp) for tp in tp_matches if tp]
 
         # If TP list is empty, reject trade
-        if not take_profits:
+        if not signal_tp_prices:
             logging.warning("No valid TP found")
             return None
+
+        raw_tp_prices_for_db = signal_tp_prices
+
+        filtered_tp_prices = []
+        max_tps_to_check = min(len(signal_tp_prices), len(TP_SPLIT_PERCENTAGES))
+        for i in range(max_tps_to_check):
+            # Nur Preise übernehmen, wenn der konfigurierte Prozentsatz > 0 ist
+            if TP_SPLIT_PERCENTAGES[i] > 0:
+                filtered_tp_prices.append(signal_tp_prices[i])
+
+        take_profits = filtered_tp_prices
 
         # LEVERAGE
         lev_match = re.search(r"LEVERAGE:\s*[xX]?\s*(\d+)", clean_text)
@@ -450,6 +466,7 @@ async def parse_signal(text: str):
             "type": position_type,
             "entry": entry_price,
             "sl": stop_loss,
+            "raw_tps": raw_tp_prices_for_db,
             "tps": take_profits,
             "leverage": leverage
         }
@@ -523,7 +540,7 @@ async def save_trade_to_db(signal: dict, market_success: bool, sl_success: bool,
 
 def _save_trade_sync(signal: dict, market_success: bool, sl_success: bool, tp_success_list: list[bool], raw_text: str, is_active: bool):
     """Synchrone Funktion zum Speichern (für asyncio.to_thread)."""
-    tp_prices = signal.get("tps", [])
+    tp_prices_for_db = signal.get("raw_tps", [])
     with get_db() as db:
         db_signal = TradingSignal(
             user_key=BOT_USER_KEY,
@@ -534,9 +551,9 @@ def _save_trade_sync(signal: dict, market_success: bool, sl_success: bool, tp_su
             leverage=signal["leverage"],
             total_size=signal["position_size"],
             
-            tp1_price=tp_prices[0] if len(tp_prices) > 0 else None,
-            tp2_price=tp_prices[1] if len(tp_prices) > 1 else None,
-            tp3_price=tp_prices[2] if len(tp_prices) > 2 else None,
+            tp1_price=tp_prices_for_db[0] if len(tp_prices_for_db) > 0 else None,
+            tp2_price=tp_prices_for_db[1] if len(tp_prices_for_db) > 1 else None,
+            tp3_price=tp_prices_for_db[2] if len(tp_prices_for_db) > 2 else None,
 
             tp1_order_placed=tp_success_list[0] if len(tp_success_list) > 0 else False,
             tp2_order_placed=tp_success_list[1] if len(tp_success_list) > 1 else False,
