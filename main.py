@@ -353,25 +353,30 @@ async def recalculate_tp_sizes(total_size: float, base_symbol: str) -> list[floa
     # The list TP_SPLIT_PERCENTAGES already contains the normalized percentages
     # (e.g., [0.5, 0.3, 0.2]) including the adjustment for the remainder (see get_tp_config).
 
-    tp_sizes = []
+    tp_sizes_unfiltered = []
     current_remainder = total_size
     
     for i, percent in enumerate(tp_split_percentages):
-        if i == len(tp_split_percentages) - 1:
-            # For the last element, use the remainder of the total size 
-            tp_size = round(current_remainder, size_scale)
-        else:
-            tp_size_raw = total_size * percent
-            tp_size = round(tp_size_raw, size_scale)
-            current_remainder -= tp_size
+        tp_size = 0.0
+        if percent > 0: 
+            if i == len(tp_split_percentages) - 1:
+                # Für das letzte Element den Rest der Gesamtgröße verwenden (wg. Rundung)
+                tp_size = round(current_remainder, size_scale)
+            else:
+                tp_size_raw = total_size * percent
+                tp_size = round(tp_size_raw, size_scale)
+            
+            # Subtrahiere die Größe nur, wenn sie berechnet wurde und nicht das letzte Element ist
+            if i < len(tp_split_percentages) - 1:
+                 current_remainder -= tp_size
+                 
+        tp_sizes_unfiltered.append(tp_size)
         
-        if tp_size > 0:
-            tp_sizes.append(tp_size)
     
     # Log the result for debugging/tracking
-    logging.info("[RECALC] Recalculated TP sizes based on new total size (%.4f): %s", total_size, tp_sizes)
+    logging.info("[RECALC] Recalculated TP sizes based on new total size (%.4f): %s", total_size, tp_sizes_unfiltered)
     
-    return tp_sizes
+    return tp_sizes_unfiltered
 
 
 def validate_trade(position_type, stop_loss, take_profits, current_price):
@@ -829,7 +834,21 @@ async def place_bitget_trade(signal, test_mode=True):
     signal["position_size"] = final_position_size
     base_symbol = symbol.replace("_UMCBL", "")
     final_tp_sizes = await recalculate_tp_sizes(final_position_size, base_symbol)
-    signal["tp_sizes"] = final_tp_sizes
+    signal["tp_sizes"] = final_tp_sizes 
+
+    full_sizes = final_tp_sizes
+    all_tp_data = [] 
+    price_list_index = 0
+    
+    for i in range(len(TP_SPLIT_PERCENTAGES)):
+        size = full_sizes[i]
+        price = None
+
+        if size > 0 and price_list_index < len(tp_prices):
+            price = tp_prices[price_list_index] 
+            price_list_index += 1
+            
+        all_tp_data.append((price, size))
 
     num_splits = len(final_tp_sizes)
     if not final_tp_sizes:
@@ -864,9 +883,10 @@ async def place_bitget_trade(signal, test_mode=True):
         sl_success = True
 
     # --- 3. Take-Profit Orders ---
-    for i, (tp_price, tp_size) in enumerate(zip(tp_prices, tp_sizes)):
-        if tp_size <= 0: 
+    for i, (tp_price, tp_size) in enumerate(all_tp_data):
+        if tp_size <= 0 or tp_price is None:
             tp_success_list.append(False)
+            logging.info(f"TP{i+1} skipped (Size: {tp_size}, Price: {tp_price}). Success set to False.")
             continue
         
         tp_resp = await place_conditional_order(
@@ -880,8 +900,6 @@ async def place_bitget_trade(signal, test_mode=True):
         tp_success_list.append(success)
         logging.info(f"TP{i+1} Plan order (Price: {tp_price}, Size: {tp_size}) Response: %s", tp_resp)
     
-    while len(tp_success_list) < len(TP_SPLIT_PERCENTAGES):
-        tp_success_list.append(False)
     
     await save_trade_to_db(
         signal, 
