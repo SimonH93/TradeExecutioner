@@ -788,7 +788,7 @@ async def save_trade_to_db(signal: dict, market_success: bool, sl_success: bool,
         return
 
     try:
-        await asyncio.to_thread(_save_trade_sync, signal, market_success, sl_success, tp_success_list, raw_text, is_active)
+        await asyncio.to_thread(_save_trade_sync, signal, market_success, sl_success, tp_success_list, tp_ids, sl_id, raw_text, is_active)
     except Exception as e:
         logging.error("Database save failed: %s", e)
 
@@ -812,6 +812,11 @@ def _save_trade_sync(signal: dict, market_success: bool, sl_success: bool, tp_su
             tp1_order_placed=tp_success_list[0] if len(tp_success_list) > 0 else False,
             tp2_order_placed=tp_success_list[1] if len(tp_success_list) > 1 else False,
             tp3_order_placed=tp_success_list[2] if len(tp_success_list) > 2 else False,
+
+            tp1_order_id=tp_ids[0] if len(tp_ids) > 0 else None,
+            tp2_order_id=tp_ids[1] if len(tp_ids) > 1 else None,
+            tp3_order_id=tp_ids[2] if len(tp_ids) > 2 else None,
+            sl_order_id=sl_id,
 
             market_order_placed=market_success,
             sl_order_placed=sl_success,
