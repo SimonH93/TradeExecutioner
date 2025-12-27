@@ -4,7 +4,7 @@ import hashlib
 import hmac
 import json
 import logging
-import uvicorn
+import websockets
 import os
 import re
 import time
@@ -111,9 +111,16 @@ if DATABASE_URL:
         tp1_reached = Column(Boolean, default=False)
         tp2_reached = Column(Boolean, default=False)
         tp3_reached = Column(Boolean, default=False)
+        sl_reached = Column(Boolean, default=False)
         tp1_order_placed = Column(Boolean, default=False)
         tp2_order_placed = Column(Boolean, default=False)
         tp3_order_placed = Column(Boolean, default=False)
+
+        tp1_order_id = Column(String, nullable=True)
+        tp2_order_id = Column(String, nullable=True)
+        tp3_order_id = Column(String, nullable=True)
+        sl_order_id = Column(String, nullable=True)
+        
         
         # Order-Status und Metadaten
         market_order_placed = Column(Boolean, default=False)
@@ -154,6 +161,250 @@ def read_root():
     """Health Check."""
     return {"status": "Service is running", "mode": "Webhook Bot"}
 
+async def handle_tp_trigger(triggered_order_id, symbol):
+    # 1. Trade in DB finden
+    # Wir müssen prüfen, ob diese order_id eine TP1, TP2 oder TP3 ID in unserer DB ist
+    
+    # Hier nutzen wir sync DB access in einem Thread, um async nicht zu blockieren
+    trade_signal = await asyncio.to_thread(find_trade_by_tp_id, triggered_order_id)
+    
+    if not trade_signal:
+        return # Nicht unsere Order oder schon erledigt
+
+    current_sl_id = trade_signal.sl_order_id
+    new_sl_price = None
+    update_field = None
+
+    # Logik: Welcher TP war es?
+    if trade_signal.tp1_order_id == triggered_order_id:
+        logging.info(f"TP1 reached for Trade {trade_signal.id}")
+        new_sl_price = trade_signal.entry_price # Breakeven
+        update_field = "tp1_reached"
+        
+    elif trade_signal.tp2_order_id == triggered_order_id:
+        logging.info(f"TP2 reached for Trade {trade_signal.id}")
+        new_sl_price = trade_signal.tp1_price # SL auf TP1
+        update_field = "tp2_reached"
+        
+    # SL Verschieben Logik
+    if new_sl_price and current_sl_id:
+        # 1. Alten SL stornieren
+        cancel_success = await cancel_plan_order(symbol, current_sl_id)
+        
+        if cancel_success:
+            # 2. Neuen SL setzen
+            # Achtung: side muss "close_long" (sell) oder "close_short" (buy) sein
+            side = "close_long" if trade_signal.position_type == "LONG" else "close_short"
+            
+            # Wir müssen die REST-Size wissen. Entweder aus DB tracken oder Position abfragen.
+            # Vereinfacht: Wir nehmen die aktuelle Size aus der DB (total_size minus bereits ausgeführte TPs)
+            # Eine sicherere Methode ist, die offene Position via API abzufragen (get_position_details).
+            
+            # Für dieses Beispiel nehmen wir an, wir setzen SL für die Restmenge
+            # (Das erfordert etwas mehr Logik zur Berechnung der Restmenge)
+            remaining_size = calculate_remaining_size(trade_signal) 
+            
+            sl_resp = await place_conditional_order(
+                symbol=trade_signal.symbol,
+                size=remaining_size,
+                trigger_price=new_sl_price,
+                side=side,
+                is_sl=True
+            )
+            
+            if sl_resp and sl_resp.get("data", {}).get("orderId"):
+                new_sl_id = sl_resp["data"]["orderId"]
+                # DB Update: Alter SL weg, neuer SL da, TP Status update
+                await asyncio.to_thread(update_trade_db, trade_signal.id, update_field, new_sl_id)
+
+def update_trade_db(signal_id: int, update_field: str, new_sl_id: str = None):
+    """Aktualisiert den Status eines Trades in der DB."""
+    with get_db() as db:
+        trade = db.query(TradingSignal).filter(TradingSignal.id == signal_id).first()
+        if trade:
+            if update_field == "tp1_reached":
+                trade.tp1_reached = True
+            elif update_field == "tp2_reached":
+                trade.tp2_reached = True
+            elif update_field == "sl_reached":
+                trade.sl_reached = True
+            
+            if new_sl_id:
+                trade.sl_order_id = new_sl_id
+            
+            db.commit()
+            logging.info(f"DB Update for Trade {signal_id}: {update_field} marked.")
+
+async def cancel_plan_order(symbol: str, order_id: str):
+    """Storniert eine bestehende Plan-Order (SL oder TP)."""
+    url_path = "/api/v2/mix/order/cancel-plan-order"
+    url = f"{BASE_URL}{url_path}"
+    timestamp = str(int(time.time() * 1000))
+    
+    
+    payload = {
+        "symbol": symbol.replace("_UMCBL", ""),
+        "productType": "USDT-FUTURES",
+        "marginCoin": "USDT",
+        "orderId": order_id
+    }
+    
+    body = json.dumps(payload)
+    signature = sign_request("POST", url_path, timestamp, body)
+    
+    headers = {
+        "ACCESS-KEY": BITGET_API_KEY,
+        "ACCESS-SIGN": signature,
+        "ACCESS-TIMESTAMP": timestamp,
+        "ACCESS-PASSPHRASE": BITGET_PASSWORD,
+        "Content-Type": "application/json"
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=5) as client:
+            resp = await client.post(url, headers=headers, data=body)
+            data = resp.json()
+            if data.get("code") == "00000":
+                logging.info(f"Successfully cancelled Plan Order: {order_id}")
+                return True
+            else:
+                logging.error(f"Failed to cancel Plan Order {order_id}: {data}")
+                return False
+    except Exception as e:
+        logging.error(f"Error calling cancel-plan-order: {e}")
+        return False
+
+def calculate_remaining_size(trade_signal):
+    """
+    Berechnet die verbleibende Position für den neuen Stop Loss.
+    Bitget V2 Plan-Orders benötigen die exakte Menge.
+    """
+    # Summiere alle TPs, die noch nicht erreicht wurden
+    remaining = trade_signal.total_size
+    if trade_signal.tp1_reached:
+        remaining -= (trade_signal.total_size * TP_SPLIT_PERCENTAGES[0])
+    if trade_signal.tp2_reached:
+        remaining -= (trade_signal.total_size * TP_SPLIT_PERCENTAGES[1])
+    return round(remaining, 4)
+
+def find_trade_by_tp_id(order_id):
+    with get_db() as db:
+        return db.query(TradingSignal).filter(
+            (TradingSignal.tp1_order_id == order_id) |
+            (TradingSignal.tp2_order_id == order_id) |
+            (TradingSignal.tp3_order_id == order_id)
+        ).first()
+
+# Globale Variable für die Verbindung
+ws_client = None
+
+class BitgetWSClient:
+    def __init__(self):
+        self.url = "wss://ws.bitget.com/v2/ws/private"
+        self.api_key = os.getenv("BITGET_API_KEY")
+        self.api_secret = os.getenv("BITGET_API_SECRET")
+        self.passphrase = os.getenv("BITGET_PASSWORD")
+        self.running = False
+
+    def _generate_signature(self, timestamp):
+        # Bitget V2 WS Auth Signatur (identisch zu REST, aber simpler Payload)
+        message = f"{timestamp}GET/user/verify"
+        h = hmac.new(self.api_secret.encode("utf-8"), message.encode("utf-8"), hashlib.sha256)
+        return base64.b64encode(h.digest()).decode("utf-8")
+
+    async def connect(self):
+        self.running = True
+        while self.running:
+            try:
+                async with websockets.connect(self.url) as websocket:
+                    logging.info("WebSocket connected.")
+                    await self._login(websocket)
+                    await self._subscribe(websocket)
+                    
+                    # Heartbeat Loop & Listen Loop parallel
+                    listener = asyncio.create_task(self._listen(websocket))
+                    pinger = asyncio.create_task(self._keep_alive(websocket))
+                    
+                    done, pending = await asyncio.wait(
+                        [listener, pinger],
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                    
+                    for task in pending:
+                        task.cancel()
+                        
+            except Exception as e:
+                logging.error(f"WebSocket connection failed: {e}. Reconnecting in 5s...")
+                await asyncio.sleep(5)
+
+    async def _login(self, ws):
+        timestamp = str(int(time.time()))
+        sign = self._generate_signature(timestamp)
+        login_msg = {
+            "op": "login",
+            "args": [{
+                "apiKey": self.api_key,
+                "passphrase": self.passphrase,
+                "timestamp": timestamp,
+                "sign": sign
+            }]
+        }
+        await ws.send(json.dumps(login_msg))
+
+    async def _subscribe(self, ws):
+        # Wir abonnieren 'orders-algo' für Plan Orders (TP/SL)
+        sub_msg = {
+            "op": "subscribe",
+            "args": [
+                {
+                    "instType": "USDT-FUTURES",
+                    "channel": "orders-algo",
+                    "instId": "default" # 'default' = alle Paare
+                }
+            ]
+        }
+        await ws.send(json.dumps(sub_msg))
+        logging.info("Subscribed to orders-algo.")
+
+    async def _keep_alive(self, ws):
+        """Sendet 'ping' alle 30 Sekunden"""
+        while True:
+            await asyncio.sleep(30)
+            await ws.send("ping")
+
+    async def _listen(self, ws):
+        async for message in ws:
+            if message == "pong":
+                continue
+            
+            data = json.loads(message)
+            
+            # Prüfen auf Push-Daten
+            if data.get("action") == "push" and data.get("arg", {}).get("channel") == "orders-algo":
+                await self._handle_order_update(data["data"])
+
+    async def _handle_order_update(self, update_list):
+        # Hier passiert die Magie
+        for order in update_list:
+            # Wichtige Felder laut Bitget V2 API Docs für Plan Orders:
+            # orderId: Die ID der Plan Order
+            # status: "live", "executed" (getriggert), "fail", "cancel"
+            # planType: "normal_plan" (nutzt du), "profit_plan", "loss_plan"
+            
+            order_id = order.get("orderId")
+            status = order.get("status")
+            symbol = order.get("instId") # z.B. BTCUSDT
+            
+            if status == "executed":
+                with get_db() as db:
+                    is_sl = db.query(TradingSignal).filter(TradingSignal.sl_order_id == order_id).first()
+                    if is_sl:
+                        update_trade_db(is_sl.id, "sl_reached")
+                        logging.info(f"STOP LOSS reached for Trade {is_sl.id}. Monitoring stopped.")
+                        continue 
+                logging.info(f"Plan Order {order_id} triggered/executed on {symbol}!")
+                await handle_tp_trigger(order_id, symbol) # Implementierung siehe unten
+
 
 @app.post("/process_signal")
 async def process_router_signal(update: dict):
@@ -174,8 +425,6 @@ async def process_router_signal(update: dict):
         asyncio.create_task(place_bitget_trade(signal, test_mode=TEST_MODE))
 
     return {"status": "ok"}
-
-# --- START THE APPLICATION ---
 
 async def get_current_price(symbol: str, product_type: str = "USDT-FUTURES") -> float:
     url = f"{BASE_URL}/api/v2/mix/market/ticker"
@@ -533,7 +782,7 @@ async def set_leverage(symbol: str, leverage: int, margin_mode: str = "crossed")
         logging.error("[ERROR] Set Leverage Request failed (network/timeout): %s", e)
         return False
 
-async def save_trade_to_db(signal: dict, market_success: bool, sl_success: bool, tp_success_list: list[bool], raw_text: str, is_active: bool):
+async def save_trade_to_db(signal: dict, market_success: bool, sl_success: bool, tp_success_list: list[bool], tp_ids: list, sl_id: str, raw_text: str, is_active: bool):
     """Persistiert die Handelsdaten in der Datenbank."""
     if not get_db:
         return
@@ -543,7 +792,7 @@ async def save_trade_to_db(signal: dict, market_success: bool, sl_success: bool,
     except Exception as e:
         logging.error("Database save failed: %s", e)
 
-def _save_trade_sync(signal: dict, market_success: bool, sl_success: bool, tp_success_list: list[bool], raw_text: str, is_active: bool):
+def _save_trade_sync(signal: dict, market_success: bool, sl_success: bool, tp_success_list: list[bool], tp_ids: list, sl_id: str, raw_text: str, is_active: bool):
     """Synchrone Funktion zum Speichern (für asyncio.to_thread)."""
     tp_prices_for_db = signal.get("raw_tps", [])
     with get_db() as db:
@@ -879,10 +1128,13 @@ async def place_bitget_trade(signal, test_mode=True):
         is_sl=True # Marks as SL -> orderType="market"
     )
     logging.info("Stop-Loss Plan Order Response: %s", sl_resp)
-    if sl_resp:
+    sl_order_id = None
+    if sl_resp and "data" in sl_resp:
         sl_success = True
+        sl_order_id = sl_resp["data"]["orderId"]
 
     # --- 3. Take-Profit Orders ---
+    tp_ids = [None, None, None]
     for i, (tp_price, tp_size) in enumerate(all_tp_data):
         if tp_size <= 0 or tp_price is None:
             tp_success_list.append(False)
@@ -896,6 +1148,9 @@ async def place_bitget_trade(signal, test_mode=True):
             side=closing_side,
             is_sl=False # Marks as TP -> orderType="limit"
         )
+        if tp_resp and "data" in tp_resp:
+            tp_ids[i] = tp_resp["data"]["orderId"]
+
         success = bool(tp_resp)
         tp_success_list.append(success)
         logging.info(f"TP{i+1} Plan order (Price: {tp_price}, Size: {tp_size}) Response: %s", tp_resp)
@@ -906,8 +1161,25 @@ async def place_bitget_trade(signal, test_mode=True):
         market_success=market_success, 
         sl_success=sl_success, 
         tp_success_list=tp_success_list,
+        tp_ids=tp_ids,      
+        sl_id=sl_order_id,
         raw_text=signal.get("raw_text", "N/A"),
         is_active=True
     )
 
     logging.info("[INFO] All orders (Market, SL, 3xTP) have been sent.")
+
+@app.on_event("startup")
+async def startup_event():
+    # DB Init
+    init_db()
+    
+    # Start WebSocket Monitor
+    global ws_client
+    ws_client = BitgetWSClient()
+    asyncio.create_task(ws_client.connect())
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    if ws_client:
+        ws_client.running = False
