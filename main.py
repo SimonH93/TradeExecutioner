@@ -487,8 +487,8 @@ async def get_symbol_metadata(base_symbol: str) -> dict:
     if base_symbol in SYMBOL_INFO_CACHE:
         return SYMBOL_INFO_CACHE[base_symbol]
 
-    url = f"{BASE_URL}/api/v3/market/instruments" 
-    params = {"category": "USDT-FUTURES"}
+    url = f"https://api.bitget.com/api/v2/mix/market/symbols"
+    params = {"productType": "USDT-FUTURES"}
 
     fallback = {
         "sizeScale": 4, 
@@ -510,43 +510,34 @@ async def get_symbol_metadata(base_symbol: str) -> dict:
         for symbol_info in data["data"]:
             symbol = symbol_info["symbol"]
             if not symbol: continue
-            if symbol == base_symbol: 
-                size_scale_raw = symbol_info.get("quantityPrecision")
-                price_scale_raw = symbol_info.get("pricePrecision")
-                max_order_qty_raw = symbol_info.get("maxOrderQty")
-                max_market_qty_raw = symbol_info.get("maxMarketOrderQty")
+            if symbol.upper() == base_symbol.upper():
+                size_scale_raw = symbol_info.get("sizeScale")
+                price_scale_raw = symbol_info.get("priceScale")
+                max_order_qty_raw = symbol_info.get("maxLimitOrderSize")
+                max_market_qty_raw = symbol_info.get("maxMarketOrderSize")
 
                 if size_scale_raw is None or price_scale_raw is None:
                     logging.warning("Precision (quantityPrecision or pricePrecision) not found for %s. Defaulting to 4/4.", base_symbol)
                     return fallback
-                else:
-                    metadata = {
-                        "sizeScale": int(size_scale_raw),
-                        "priceScale": int(price_scale_raw)
+                
+                metadata = {
+                    "sizeScale": int(size_scale_raw),
+                    "priceScale": int(price_scale_raw)
                     }
-
-                if max_order_qty_raw is not None:
-                    metadata["maxLimitQty"] = float(max_order_qty_raw)
-                if max_market_qty_raw is not None:
-                    metadata["maxMarketQty"] = float(max_market_qty_raw)
-                metadata.setdefault("maxLimitQty", fallback["maxLimitQty"])
-                metadata.setdefault("maxMarketQty", fallback["maxMarketQty"])
+                metadata["maxLimitQty"] = float(max_order_qty_raw) if max_order_qty_raw else fallback["maxLimitQty"]
+                metadata["maxMarketQty"] = float(max_market_qty_raw) if max_market_qty_raw else fallback["maxMarketQty"]
 
                 SYMBOL_INFO_CACHE[base_symbol] = metadata
-                logging.info("[DEBUG] Fetched metadata for %s: quantityPrecision=%d, pricePrecision=%d, maxLimitQty=%f, maxMarketQty=%f", 
-                             base_symbol, 
-                             metadata["sizeScale"], 
-                             metadata["priceScale"], 
-                             metadata["maxLimitQty"], 
-                             metadata["maxMarketQty"])
+                logging.info("[DEBUG] Fetched V2 metadata for %s: sizeScale=%d, priceScale=%d", 
+                             base_symbol, metadata["sizeScale"], metadata["priceScale"])
                 return metadata
                 
-        logging.warning("Metadata not found for symbol %s in market instruments list. Defaulting to fallback.", base_symbol)
+        logging.warning("Metadata not found for symbol %s in V2 list. Using fallback.", base_symbol)
         return fallback
         
     except Exception as e:
-        logging.error("Error fetching symbol precision: %s", e)
-        return 4 # Fallback for errors
+        logging.error("Error fetching symbol metadata: %s", e)
+        return fallback
 
 async def get_quantity_scale(base_symbol: str) -> int:
     """Returns the precision for the position size."""
