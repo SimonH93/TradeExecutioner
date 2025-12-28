@@ -355,6 +355,11 @@ class BitgetWSClient:
                     "instType": "USDT-FUTURES",
                     "channel": "orders-algo",
                     "instId": "default" # 'default' = all Pairs
+                },
+                {
+                    "instType": "USDT-FUTURES",
+                    "channel": "orders", 
+                    "instId": "default"
                 }
             ]
         }
