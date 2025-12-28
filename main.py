@@ -162,9 +162,15 @@ def read_root():
     return {"status": "Service is running", "mode": "Webhook Bot"}
 
 async def handle_tp_trigger(triggered_order_id, symbol):
-    trade_signal = await asyncio.to_thread(find_trade_by_tp_id, triggered_order_id)
+    trade_signal = None
+    for _ in range(3):
+        trade_signal = await asyncio.to_thread(find_trade_by_tp_id, triggered_order_id)
+        if trade_signal:
+            break
+        await asyncio.sleep(0.5)
     
     if not trade_signal:
+        logging.warning(f"Kein aktiver Trade für Trigger {triggered_order_id} gefunden (auch nach Retry).")
         return
 
     current_sl_id = trade_signal.sl_order_id
@@ -268,13 +274,15 @@ def calculate_remaining_size(trade_signal):
     Berechnet die verbleibende Position für den neuen Stop Loss.
     Bitget V2 Plan-Orders benötigen die exakte Menge.
     """
-    # Summiere alle TPs, die noch nicht erreicht wurden
-    remaining = trade_signal.total_size
+    total = float(trade_signal.total_size)
+    used = 0.0
     if trade_signal.tp1_reached:
-        remaining -= (trade_signal.total_size * TP_SPLIT_PERCENTAGES[0])
+        used += float(format(total * TP_SPLIT_PERCENTAGES[0], ".2f"))
     if trade_signal.tp2_reached:
-        remaining -= (trade_signal.total_size * TP_SPLIT_PERCENTAGES[1])
-    return remaining
+        used += float(format(total * TP_SPLIT_PERCENTAGES[1], ".2f"))
+        
+    remaining = total - used
+    return round(remaining, 4)
 
 def find_trade_by_tp_id(order_id):
     with get_db() as db:
@@ -414,7 +422,7 @@ class BitgetWSClient:
                             logging.info(f"Plan-Order getriggert: {order.get('orderId')}")
                 elif channel == "orders":
                     for order in order_data_list:
-                        if order.get("status") == "filled":
+                        if order.get("status") == "filled" and order.get("tradeSide") == "close":
                             trigger_id = order.get("clientOid")
                             symbol = order.get("instId") 
                             logging.info(f"Echte Markt-Order ausgeführt! Ursprungs-Trigger: {trigger_id}")
@@ -1097,6 +1105,7 @@ async def place_bitget_trade(signal, test_mode=True):
         return
     
     market_success = True
+    total_size = float(initial_position_size)
     signal["position_size"] = final_position_size
     base_symbol = symbol.replace("_UMCBL", "")
     final_tp_sizes = await recalculate_tp_sizes(final_position_size, base_symbol)
@@ -1151,11 +1160,34 @@ async def place_bitget_trade(signal, test_mode=True):
         sl_order_id = sl_resp["data"]["orderId"]
 
     # --- 3. Take-Profit Orders ---
+    metadata = await get_symbol_metadata(symbol.replace("_UMCBL", ""))
+    size_scale = metadata.get("sizeScale", 2)
+
     tp_ids = [None, None, None]
-    for i, (tp_price, tp_size) in enumerate(all_tp_data):
+    tp_success_list = []
+    accumulated_tp_size = 0.0  # Hier tracken wir, was schon verplant wurde
+    
+    num_tps_to_set = len(tp_prices)
+    
+    for i in range(num_tps_to_set):
+        tp_price = tp_prices[i]
+        
+        if i == num_tps_to_set - 1:
+            # Der letzte TP nimmt den exakten Rest der Gesamtposition
+            tp_size = float(total_size) - accumulated_tp_size
+        else:
+            # Zwischen-TPs nach Prozenten berechnen
+            raw_size = float(total_size) * TP_SPLIT_PERCENTAGES[i]
+            # Sofort auf die richtige Scale formatieren
+            tp_size = float(format(raw_size, f".{size_scale}f"))
+        
+        # Sicherstellen, dass wir keine negativen Werte durch Rundung bekommen
+        tp_size = max(0, float(format(tp_size, f".{size_scale}f")))
+        accumulated_tp_size += tp_size
+
         if tp_size <= 0 or tp_price is None:
             tp_success_list.append(False)
-            logging.info(f"TP{i+1} skipped (Size: {tp_size}, Price: {tp_price}). Success set to False.")
+            logging.info(f"TP{i+1} übersprungen (Größe 0 oder kein Preis)")
             continue
         
         tp_resp = await place_conditional_order(
