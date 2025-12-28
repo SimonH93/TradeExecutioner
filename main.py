@@ -405,12 +405,20 @@ class BitgetWSClient:
                 logging.error(f"BITGET WS ERROR: {data}")
 
             # 4. Process push messages
-            elif data.get("action") == "push" and data.get("arg", {}).get("channel") == "orders-algo":
-                logging.info(f"ALGO ORDER UPDATE: {data['data']}")
-                await self._handle_order_update(data["data"])
+            action = data.get("action")
+            if action in ["push", "snapshot"]:
+                channel = data.get("arg", {}).get("channel")
+            
+                if channel == "orders-algo":
+                    for order in data.get("data", []):
+                        status = order.get("status")
+                        order_id = order.get("orderId")
+                        
+                        if status == "executed":
+                            logging.info(f"TP/SL Triggered! OrderID: {order_id}")
+                            await self._handle_order_update(order)
 
     async def _handle_order_update(self, update_list):
-        # Hier passiert die Magie
         for order in update_list:
             order_id = order.get("orderId")
             status = order.get("status")
