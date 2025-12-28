@@ -314,7 +314,6 @@ class BitgetWSClient:
                 async with websockets.connect(self.url, ping_interval=None) as websocket:
                     logging.info("WebSocket connected.")
                     await self._login(websocket)
-                    await self._subscribe(websocket)
                     
                     # Heartbeat Loop & Listen Loop parallel
                     listener = asyncio.create_task(self._listen(websocket))
@@ -386,23 +385,28 @@ class BitgetWSClient:
             except json.JSONDecodeError:
                 logging.error(f"Could not decode JSON: {message}")
                 continue
+            
+            # 1. Event handling
+            event = data.get("event")
 
-            if data.get("event") == "error":
-                logging.error(f"BITGET WS ERROR: {data}")
-                # Hier könnten wir die Connection neustarten, falls kritisch
-                continue
-
-            if data.get("event") == "login":
-                if data.get("code") == "00000":
-                    logging.info("Bitget Login Successful.")
+            # 2. Check login confirmation
+            if event == "login":
+                code = data.get("code")
+                if code == 0 or code == "00000":
+                    logging.info("Bitget Login Confirmed. Sending Subscription now...")
+                    await self._subscribe(ws)
                 else:
-                    logging.error(f"Bitget Login Failed: {data}")
-            
-            if data.get("event") == "subscribe":
-                logging.info(f"Subscription Confirmed: {data}")
-            
-            # Prüfen auf Push-Daten
-            if data.get("action") == "push" and data.get("arg", {}).get("channel") == "orders-algo":
+                    logging.error(f"Bitget Login Failed with code: {code}")
+
+            elif event == "subscribe":
+                logging.info(f"Subscription confirmed for: {data.get('arg')}")
+
+            elif event == "error":
+                logging.error(f"BITGET WS ERROR: {data}")
+
+            # 4. Process push messages
+            elif data.get("action") == "push" and data.get("arg", {}).get("channel") == "orders-algo":
+                logging.info(f"ALGO ORDER UPDATE: {data['data']}")
                 await self._handle_order_update(data["data"])
 
     async def _handle_order_update(self, update_list):
