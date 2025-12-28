@@ -162,20 +162,15 @@ def read_root():
     return {"status": "Service is running", "mode": "Webhook Bot"}
 
 async def handle_tp_trigger(triggered_order_id, symbol):
-    # 1. Trade in DB finden
-    # Wir müssen prüfen, ob diese order_id eine TP1, TP2 oder TP3 ID in unserer DB ist
-    
-    # Hier nutzen wir sync DB access in einem Thread, um async nicht zu blockieren
     trade_signal = await asyncio.to_thread(find_trade_by_tp_id, triggered_order_id)
     
     if not trade_signal:
-        return # Nicht unsere Order oder schon erledigt
+        return
 
     current_sl_id = trade_signal.sl_order_id
     new_sl_price = None
     update_field = None
 
-    # Logik: Welcher TP war es?
     if trade_signal.tp1_order_id == triggered_order_id:
         logging.info(f"TP1 reached for Trade {trade_signal.id}")
         new_sl_price = trade_signal.entry_price # Breakeven
@@ -316,7 +311,7 @@ class BitgetWSClient:
         self.running = True
         while self.running:
             try:
-                async with websockets.connect(self.url) as websocket:
+                async with websockets.connect(self.url, ping_interval=None) as websocket:
                     logging.info("WebSocket connected.")
                     await self._login(websocket)
                     await self._subscribe(websocket)
@@ -350,34 +345,61 @@ class BitgetWSClient:
             }]
         }
         await ws.send(json.dumps(login_msg))
+        logging.info("Login request sent.")
 
     async def _subscribe(self, ws):
-        # Wir abonnieren 'orders-algo' für Plan Orders (TP/SL)
+        # 'orders-algo' for Plan Orders (TP/SL)
         sub_msg = {
             "op": "subscribe",
             "args": [
                 {
                     "instType": "USDT-FUTURES",
                     "channel": "orders-algo",
-                    "instId": "default" # 'default' = alle Paare
+                    "instId": "default" # 'default' = all Pairs
                 }
             ]
         }
         await ws.send(json.dumps(sub_msg))
-        logging.info("Subscribed to orders-algo.")
+        logging.info("Subscribe request sent to orders-algo.")
 
     async def _keep_alive(self, ws):
-        """Sendet 'ping' alle 30 Sekunden"""
+        """Sendet 'ping' alle 20 Sekunden"""
         while True:
-            await asyncio.sleep(30)
-            await ws.send("ping")
+            await asyncio.sleep(20)
+            try:
+                await ws.send("ping")
+                logging.debug("Ping sent")
+            except Exception as e:
+                    logging.error(f"Error sending ping: {e}")
+                    break
 
     async def _listen(self, ws):
         async for message in ws:
-            if message == "pong":
+            if str(message).strip() == "pong":
+                logging.debug("Pong received")
                 continue
+
+            logging.info(f"WS RAW MSG: {message}")
             
-            data = json.loads(message)
+            try:
+                data = json.loads(message)
+            except json.JSONDecodeError:
+                logging.error(f"Could not decode JSON: {message}")
+                continue
+
+            if data.get("event") == "error":
+                logging.error(f"BITGET WS ERROR: {data}")
+                # Hier könnten wir die Connection neustarten, falls kritisch
+                continue
+
+            if data.get("event") == "login":
+                if data.get("code") == "00000":
+                    logging.info("Bitget Login Successful.")
+                else:
+                    logging.error(f"Bitget Login Failed: {data}")
+            
+            if data.get("event") == "subscribe":
+                logging.info(f"Subscription Confirmed: {data}")
             
             # Prüfen auf Push-Daten
             if data.get("action") == "push" and data.get("arg", {}).get("channel") == "orders-algo":
@@ -386,11 +408,6 @@ class BitgetWSClient:
     async def _handle_order_update(self, update_list):
         # Hier passiert die Magie
         for order in update_list:
-            # Wichtige Felder laut Bitget V2 API Docs für Plan Orders:
-            # orderId: Die ID der Plan Order
-            # status: "live", "executed" (getriggert), "fail", "cancel"
-            # planType: "normal_plan" (nutzt du), "profit_plan", "loss_plan"
-            
             order_id = order.get("orderId")
             status = order.get("status")
             symbol = order.get("instId") # z.B. BTCUSDT
