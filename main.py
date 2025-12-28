@@ -162,56 +162,43 @@ def read_root():
     return {"status": "Service is running", "mode": "Webhook Bot"}
 
 async def handle_tp_trigger(triggered_order_id, symbol):
+    logging.info(f"[TP TRIGGER] Verarbeite Trigger: {triggered_order_id}")
+    
+    # 1. Trade in DB finden (mit Retry falls DB langsam)
     trade_signal = None
     for _ in range(3):
         trade_signal = await asyncio.to_thread(find_trade_by_tp_id, triggered_order_id)
-        if trade_signal:
-            break
-        await asyncio.sleep(0.5)
-    
+        if trade_signal: break
+        await asyncio.sleep(1)
+
     if not trade_signal:
-        logging.warning(f"Kein aktiver Trade für Trigger {triggered_order_id} gefunden (auch nach Retry).")
+        logging.warning("Kein Trade zu diesem TP gefunden.")
         return
 
-    current_sl_id = trade_signal.sl_order_id
+    # 2. Status setzen & neuen SL Preis bestimmen
     new_sl_price = None
-    update_field = None
+    if triggered_order_id == trade_signal.tp1_id:
+        trade_signal.tp1_reached = True
+        new_sl_price = trade_signal.entry_price # SL auf Break-Even
+    elif triggered_order_id == trade_signal.tp2_id:
+        trade_signal.tp2_reached = True
+        new_sl_price = trade_signal.tp1_price # SL auf TP1-Niveau
 
-    if trade_signal.tp1_order_id == triggered_order_id:
-        logging.info(f"TP1 reached for Trade {trade_signal.id}")
-        new_sl_price = trade_signal.entry_price # Breakeven
-        update_field = "tp1_reached"
-        
-    elif trade_signal.tp2_order_id == triggered_order_id:
-        logging.info(f"TP2 reached for Trade {trade_signal.id}")
-        new_sl_price = trade_signal.tp1_price # SL auf TP1
-        update_field = "tp2_reached"
-        
-    # Move SL Logic
-    if new_sl_price and current_sl_id:
+    # 3. NUR den alten SL löschen
+    if trade_signal.sl_id:
+        await cancel_plan_order(symbol, trade_signal.sl_id)
+        trade_signal.sl_id = None
 
-        await asyncio.to_thread(update_trade_db, trade_signal.id, update_field)
-        trade_signal = await asyncio.to_thread(find_trade_by_tp_id, triggered_order_id)
-        cancel_success = await cancel_plan_order(symbol, current_sl_id)
-        
-        if cancel_success:
-            side = "close_long" if trade_signal.position_type == "LONG" else "close_short"
-            remaining_size = calculate_remaining_size(trade_signal) 
-            
-            sl_resp = await place_conditional_order(
-                symbol=trade_signal.symbol,
-                size=remaining_size,
-                trigger_price=new_sl_price,
-                side=side,
-                is_sl=True
-            )
-            
-            if sl_resp and sl_resp.get("data", {}).get("orderId"):
-                new_sl_id = sl_resp["data"]["orderId"]
-                await asyncio.to_thread(update_trade_db, trade_signal.id, "none", new_sl_id)
-            else:
-                logging.error(f"Konnte neuen SL für Trade {trade_signal.id} nicht platzieren!")
+    # 4. Neuen SL mit REST-Menge setzen
+    remaining_size = calculate_remaining_size(trade_signal)
+    if remaining_size > 0 and new_sl_price:
+        side = "buy" if trade_signal.signal_type.lower() == "short" else "sell"
+        sl_resp = await place_conditional_order(symbol, remaining_size, new_sl_price, side, is_sl=True)
+        if sl_resp and "data" in sl_resp:
+            trade_signal.sl_id = sl_resp["data"]["orderId"]
 
+    await asyncio.to_thread(update_trade_db, trade_signal)
+    
 def update_trade_db(signal_id: int, update_field: str, new_sl_id: str = None):
     """Aktualisiert den Status eines Trades in der DB."""
     with get_db() as db:
