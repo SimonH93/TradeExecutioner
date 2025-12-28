@@ -274,7 +274,7 @@ def calculate_remaining_size(trade_signal):
         remaining -= (trade_signal.total_size * TP_SPLIT_PERCENTAGES[0])
     if trade_signal.tp2_reached:
         remaining -= (trade_signal.total_size * TP_SPLIT_PERCENTAGES[1])
-    return round(remaining, 4)
+    return remaining
 
 def find_trade_by_tp_id(order_id):
     with get_db() as db:
@@ -505,7 +505,7 @@ async def get_symbol_metadata(base_symbol: str) -> dict:
 
         if data.get("code") != "00000":
             logging.error("API error (get_symbol_precision): %s", data)
-            return 4 # Fallback
+            return fallback # Fallback
             
         for symbol_info in data["data"]:
             symbol = symbol_info["symbol"]
@@ -981,40 +981,33 @@ async def place_conditional_order(symbol, size, trigger_price, side: str, is_sl:
         return None
 
     base_symbol = symbol.replace("_UMCBL", "")
-    original_price_scale = await get_price_scale(base_symbol)
-    max_allowed_scale = 4
-    trigger_price_scale = min(original_price_scale, max_allowed_scale)
-    rounded_trigger_price = round(trigger_price, min(original_price_scale, 4))
+    metadata = await get_symbol_metadata(base_symbol)
+    size_scale = metadata.get("sizeScale", 2)
+    price_scale = metadata.get("priceScale", 2)
+    formatted_size = format(float(size), f".{size_scale}f")
+    formatted_trigger_price = format(float(trigger_price), f".{price_scale}f")
     
     if is_sl:
-        # Stop-Loss: OrderType ist MARKET
         order_type = "market"
-        # Bei Market Orders wird kein price (Ausführungspreis) im Payload gesendet.
         execution_price = None 
-        logging.info(f"[SL-MARKET] Trigger Price: {rounded_trigger_price}. Execution: MARKET.")
     else:
         # Take-Profit: OrderType ist LIMIT
         order_type = "limit"
         # Bei Limit Orders ist der Ausführungspreis gleich dem Trigger-Preis
-        execution_price = rounded_trigger_price 
-        logging.info(f"[TP-LIMIT] Trigger Price: {rounded_trigger_price}. Execution Price: {execution_price}.")
-    
-
-    logging.info(f"[DEBUG] Applying price rounding: Original={trigger_price}, Instrument Scale={original_price_scale}, Trigger Scale ={trigger_price_scale}, Rounded={rounded_trigger_price}")
-
+        execution_price = formatted_trigger_price
 
     payload = {
         "symbol": base_symbol,
         "productType": "UMCBL",
         "marginMode": "isolated",
         "marginCoin": "USDT",
-        "size": str(size),
+        "size": formatted_size,
         "side": v2_side, 
         "orderType": order_type,
         "planType": "normal_plan",
         "tradeSide": "close",
         "reduceOnly": "yes",
-        "triggerPrice": str(rounded_trigger_price),
+        "triggerPrice": formatted_trigger_price,
         "triggerType": "mark_price",
     }
 
