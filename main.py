@@ -181,22 +181,15 @@ async def handle_tp_trigger(triggered_order_id, symbol):
         new_sl_price = trade_signal.tp1_price # SL auf TP1
         update_field = "tp2_reached"
         
-    # SL Verschieben Logik
+    # Move SL Logic
     if new_sl_price and current_sl_id:
-        # 1. Alten SL stornieren
+
+        await asyncio.to_thread(update_trade_db, trade_signal.id, update_field)
+        trade_signal = await asyncio.to_thread(find_trade_by_tp_id, triggered_order_id)
         cancel_success = await cancel_plan_order(symbol, current_sl_id)
         
         if cancel_success:
-            # 2. Neuen SL setzen
-            # Achtung: side muss "close_long" (sell) oder "close_short" (buy) sein
             side = "close_long" if trade_signal.position_type == "LONG" else "close_short"
-            
-            # Wir müssen die REST-Size wissen. Entweder aus DB tracken oder Position abfragen.
-            # Vereinfacht: Wir nehmen die aktuelle Size aus der DB (total_size minus bereits ausgeführte TPs)
-            # Eine sicherere Methode ist, die offene Position via API abzufragen (get_position_details).
-            
-            # Für dieses Beispiel nehmen wir an, wir setzen SL für die Restmenge
-            # (Das erfordert etwas mehr Logik zur Berechnung der Restmenge)
             remaining_size = calculate_remaining_size(trade_signal) 
             
             sl_resp = await place_conditional_order(
@@ -209,8 +202,9 @@ async def handle_tp_trigger(triggered_order_id, symbol):
             
             if sl_resp and sl_resp.get("data", {}).get("orderId"):
                 new_sl_id = sl_resp["data"]["orderId"]
-                # DB Update: Alter SL weg, neuer SL da, TP Status update
-                await asyncio.to_thread(update_trade_db, trade_signal.id, update_field, new_sl_id)
+                await asyncio.to_thread(update_trade_db, trade_signal.id, "none", new_sl_id)
+            else:
+                logging.error(f"Konnte neuen SL für Trade {trade_signal.id} nicht platzieren!")
 
 def update_trade_db(signal_id: int, update_field: str, new_sl_id: str = None):
     """Aktualisiert den Status eines Trades in der DB."""
@@ -413,15 +407,19 @@ class BitgetWSClient:
             action = data.get("action")
             if action in ["push", "snapshot"]:
                 channel = data.get("arg", {}).get("channel")
-            
+                order_data_list = data.get("data", [])
                 if channel == "orders-algo":
-                    for order in data.get("data", []):
-                        status = order.get("status")
-                        order_id = order.get("orderId")
-                        
-                        if status == "executed":
-                            logging.info(f"TP/SL Triggered! OrderID: {order_id}")
-                            await self._handle_order_update(order)
+                    for order in order_data_list:
+                        if order.get("status") == "executed":
+                            logging.info(f"Plan-Order getriggert: {order.get('orderId')}")
+                elif channel == "orders":
+                    for order in order_data_list:
+                        if order.get("status") == "filled":
+                            trigger_id = order.get("clientOid")
+                            symbol = order.get("instId") 
+                            logging.info(f"Echte Markt-Order ausgeführt! Ursprungs-Trigger: {trigger_id}")
+                            await handle_tp_trigger(trigger_id, symbol)
+
 
     async def _handle_order_update(self, update_list):
         for order in update_list:
