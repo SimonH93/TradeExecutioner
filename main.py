@@ -484,10 +484,14 @@ async def get_current_price(symbol: str, product_type: str = "USDT-FUTURES") -> 
 async def get_symbol_metadata(base_symbol: str) -> dict:
     global SYMBOL_INFO_CACHE
     
-    if base_symbol in SYMBOL_INFO_CACHE:
-        return SYMBOL_INFO_CACHE[base_symbol]
+    search_symbol = base_symbol.upper()
+    if not search_symbol.endswith("USDT"):
+        search_symbol += "USDT"
 
-    url = f"https://api.bitget.com/api/v2/mix/market/symbols"
+    if search_symbol in SYMBOL_INFO_CACHE:
+        return SYMBOL_INFO_CACHE[search_symbol]
+
+    url = "https://api.bitget.com/api/v2/mix/market/contracts"
     params = {"productType": "USDT-FUTURES"}
 
     fallback = {
@@ -507,27 +511,19 @@ async def get_symbol_metadata(base_symbol: str) -> dict:
             logging.error("API error (get_symbol_precision): %s", data)
             return fallback # Fallback
             
-        for symbol_info in data["data"]:
-            symbol = symbol_info["symbol"]
+        for item in data["data"]:
+            symbol = item["symbol"]
             if not symbol: continue
-            if symbol.upper() == base_symbol.upper():
-                size_scale_raw = symbol_info.get("sizeScale")
-                price_scale_raw = symbol_info.get("priceScale")
-                max_order_qty_raw = symbol_info.get("maxLimitOrderSize")
-                max_market_qty_raw = symbol_info.get("maxMarketOrderSize")
+            if symbol == search_symbol:
 
-                if size_scale_raw is None or price_scale_raw is None:
-                    logging.warning("Precision (quantityPrecision or pricePrecision) not found for %s. Defaulting to 4/4.", base_symbol)
-                    return fallback
-                
                 metadata = {
-                    "sizeScale": int(size_scale_raw),
-                    "priceScale": int(price_scale_raw)
-                    }
-                metadata["maxLimitQty"] = float(max_order_qty_raw) if max_order_qty_raw else fallback["maxLimitQty"]
-                metadata["maxMarketQty"] = float(max_market_qty_raw) if max_market_qty_raw else fallback["maxMarketQty"]
-
+                    "sizeScale": int(item.get("volumePlace", 4)),
+                    "priceScale": int(item.get("pricePlace", 4)),
+                    "maxLimitQty": float(item.get("maxOrderQty", 1000000)),
+                    "maxMarketQty": float(item.get("maxMarketOrderQty", 1000000))
+                }
                 SYMBOL_INFO_CACHE[base_symbol] = metadata
+                SYMBOL_INFO_CACHE[search_symbol] = metadata
                 logging.info("[DEBUG] Fetched V2 metadata for %s: sizeScale=%d, priceScale=%d", 
                              base_symbol, metadata["sizeScale"], metadata["priceScale"])
                 return metadata
@@ -982,11 +978,11 @@ async def place_conditional_order(symbol, size, trigger_price, side: str, is_sl:
 
     base_symbol = symbol.replace("_UMCBL", "")
     metadata = await get_symbol_metadata(base_symbol)
-    size_scale = metadata.get("sizeScale", 2)
-    price_scale = metadata.get("priceScale", 2)
+    size_scale = metadata.get("sizeScale", 4)
+    price_scale = metadata.get("priceScale", 4)
     formatted_size = format(float(size), f".{size_scale}f")
     formatted_trigger_price = format(float(trigger_price), f".{price_scale}f")
-    
+
     if is_sl:
         order_type = "market"
         execution_price = None 
