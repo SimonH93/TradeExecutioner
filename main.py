@@ -228,7 +228,7 @@ async def cancel_plan_order(symbol: str, order_id: str):
         "symbol": symbol.replace("_UMCBL", ""),
         "productType": "USDT-FUTURES",
         "marginCoin": "USDT",
-        "orderId": order_id
+        "clientOid": order_id
     }
     
     body = json.dumps(payload)
@@ -399,20 +399,18 @@ class BitgetWSClient:
                 logging.error(f"BITGET WS ERROR: {data}")
 
             # 4. Process push messages
-            action = data.get("action")
-            if action in ["push", "snapshot"]:
-                channel = data.get("arg", {}).get("channel")
-                order_data_list = data.get("data", [])
-                if channel == "orders-algo":
-                    for order in order_data_list:
-                        if order.get("status") == "executed":
-                            logging.info(f"Plan-Order getriggert: {order.get('orderId')}")
-                elif channel == "orders":
-                    for order in order_data_list:
-                        if order.get("status") == "filled" and order.get("tradeSide") == "close":
-                            trigger_id = order.get("clientOid")
-                            symbol = order.get("instId") 
-                            logging.info(f"Echte Markt-Order ausgeführt! Ursprungs-Trigger: {trigger_id}")
+            channel = data.get("arg", {}).get("channel")
+            order_data_list = data.get("data", [])
+            if channel == "orders":
+                for order in order_data_list:
+                    status = order.get("status")
+                    if status in ["filled", "partially_filled"]:
+                        trigger_id = order.get("clientOid")
+                        symbol = order.get("instId")
+                        
+                        # Wichtig: Prüfen ob trigger_id existiert UND unser Prefix hat (optional, aber sicher)
+                        if trigger_id:
+                            logging.info(f"ORDER FILLED (Status: {status}). Prüfe TP-Trigger für ID: {trigger_id}")
                             await handle_tp_trigger(trigger_id, symbol)
 
 
@@ -963,6 +961,8 @@ async def place_conditional_order(symbol, size, trigger_price, side: str, is_sl:
     url_path = "/api/v2/mix/order/place-plan-order"
     url = f"{BASE_URL}{url_path}"
     timestamp = str(int(time.time() * 1000))
+    prefix = "sl" if is_sl else "tp"
+    client_oid = f"{prefix}_{int(time.time() * 1000)}_{os.urandom(2).hex()}"
     if side == "close_long":
         v2_side = "buy"
     elif side == "close_short":
@@ -1000,6 +1000,7 @@ async def place_conditional_order(symbol, size, trigger_price, side: str, is_sl:
         "reduceOnly": "yes",
         "triggerPrice": formatted_trigger_price,
         "triggerType": "mark_price",
+        "clientOid": client_oid
     }
 
     if execution_price is not None:
@@ -1019,25 +1020,17 @@ async def place_conditional_order(symbol, size, trigger_price, side: str, is_sl:
     try:
         async with httpx.AsyncClient(timeout=5) as client:
             resp = await client.post(url, headers=headers, data=body)
+            data = resp.json()
             
-            if resp.status_code >= 400:
-                try:
-                    error_data = resp.json()
-                    logging.error("[ERROR 4xx/5xx CONDITIONAL ORDER] Bitget API Status Code %d. Response Body: %s (Payload: %s)", 
-                                  resp.status_code, error_data, payload)
-                except json.JSONDecodeError:
-                    logging.error("[ERROR 4xx/5xx CONDITIONAL ORDER] Bitget API Status Code %d. Response Text: %s (Payload: %s)", 
-                                  resp.status_code, resp.text, payload)
+            if data.get("code") == "00000":
+                data["data"]["clientOid"] = client_oid 
+                return data
+            else:
+                logging.error(f"[ERROR] API Response: {data}")
                 return None
 
-            # Status 200/300
-            data = resp.json()
-            if data.get("code") != "00000":
-                logging.error("[ERROR] Bitget Conditional Plan Order API response (Status 200, but Code != 00000): %s (Payload: %s)", data, payload)
-                return None
-            return data
-    except httpx.RequestError as e:
-        logging.error("[ERROR] Conditional Order Request failed (network/timeout): %s (Payload: %s)", e, payload)
+    except Exception as e:
+        logging.error(f"[ERROR] Request failed: {e}")
         return None
 
     
@@ -1144,7 +1137,7 @@ async def place_bitget_trade(signal, test_mode=True):
     sl_order_id = None
     if sl_resp and "data" in sl_resp:
         sl_success = True
-        sl_order_id = sl_resp["data"]["orderId"]
+        sl_order_id = sl_resp["data"].get("clientOid")
 
     # --- 3. Take-Profit Orders ---
     metadata = await get_symbol_metadata(symbol.replace("_UMCBL", ""))
@@ -1185,7 +1178,7 @@ async def place_bitget_trade(signal, test_mode=True):
             is_sl=False # Marks as TP -> orderType="limit"
         )
         if tp_resp and "data" in tp_resp:
-            tp_ids[i] = tp_resp["data"]["orderId"]
+            tp_ids[i] = tp_resp["data"].get("clientOid")
 
         success = bool(tp_resp)
         tp_success_list.append(success)
