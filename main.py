@@ -400,8 +400,9 @@ class BitgetWSClient:
 
             # 4. Process push messages
             channel = data.get("arg", {}).get("channel")
-            order_data_list = data.get("data", [])
+            
             if channel == "orders":
+                order_data_list = data.get("data", [])
                 for order in order_data_list:
                     status = order.get("status")
                     if status in ["filled", "partially_filled"]:
@@ -412,24 +413,6 @@ class BitgetWSClient:
                         if trigger_id:
                             logging.info(f"ORDER FILLED (Status: {status}). Prüfe TP-Trigger für ID: {trigger_id}")
                             await handle_tp_trigger(trigger_id, symbol)
-
-
-    async def _handle_order_update(self, update_list):
-        for order in update_list:
-            order_id = order.get("orderId")
-            status = order.get("status")
-            symbol = order.get("instId") # z.B. BTCUSDT
-            
-            if status == "executed":
-                with get_db() as db:
-                    is_sl = db.query(TradingSignal).filter(TradingSignal.sl_order_id == order_id).first()
-                    if is_sl:
-                        update_trade_db(is_sl.id, "sl_reached")
-                        logging.info(f"STOP LOSS reached for Trade {is_sl.id}. Monitoring stopped.")
-                        continue 
-                logging.info(f"Plan Order {order_id} triggered/executed on {symbol}!")
-                await handle_tp_trigger(order_id, symbol) # Implementierung siehe unten
-
 
 @app.post("/process_signal")
 async def process_router_signal(update: dict):
