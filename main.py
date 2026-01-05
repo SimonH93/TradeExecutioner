@@ -177,10 +177,10 @@ async def handle_tp_trigger(triggered_order_id, symbol):
 
     # 2. Status setzen & neuen SL Preis bestimmen
     new_sl_price = None
-    if triggered_order_id == trade_signal.tp1_id:
+    if triggered_order_id == trade_signal.tp1_order_id:
         trade_signal.tp1_reached = True
         new_sl_price = trade_signal.entry_price # SL auf Break-Even
-    elif triggered_order_id == trade_signal.tp2_id:
+    elif triggered_order_id == trade_signal.tp1_order_id:
         trade_signal.tp2_reached = True
         new_sl_price = trade_signal.tp1_price # SL auf TP1-Niveau
 
