@@ -185,9 +185,9 @@ async def handle_tp_trigger(triggered_order_id, symbol):
         new_sl_price = trade_signal.tp1_price # SL auf TP1-Niveau
 
     # 3. NUR den alten SL löschen
-    if trade_signal.sl_id:
-        await cancel_plan_order(symbol, trade_signal.sl_id)
-        trade_signal.sl_id = None
+    if trade_signal.sl_order_id:
+        await cancel_plan_order(symbol, trade_signal.sl_order_id)
+        trade_signal.sl_order_id = None
 
     # 4. Neuen SL mit REST-Menge setzen
     remaining_size = calculate_remaining_size(trade_signal)
@@ -195,7 +195,7 @@ async def handle_tp_trigger(triggered_order_id, symbol):
         side = "buy" if trade_signal.signal_type.lower() == "short" else "sell"
         sl_resp = await place_conditional_order(symbol, remaining_size, new_sl_price, side, is_sl=True)
         if sl_resp and "data" in sl_resp:
-            trade_signal.sl_id = sl_resp["data"]["orderId"]
+            trade_signal.sl_order_id = sl_resp["data"]["orderId"]
 
     await asyncio.to_thread(update_trade_db, trade_signal)
     
@@ -400,7 +400,7 @@ class BitgetWSClient:
                 order_data_list = data.get("data", [])
                 for order in order_data_list:
                     status = order.get("status")
-                    if status in ["filled", "partially_filled"]:
+                    if status == "filled":
                         trigger_id = order.get("clientOid")
                         symbol = order.get("instId")
                         
