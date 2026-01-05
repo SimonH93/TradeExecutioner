@@ -228,7 +228,7 @@ async def cancel_plan_order(symbol: str, order_id: str):
         "symbol": symbol.replace("_UMCBL", ""),
         "productType": "USDT-FUTURES",
         "marginCoin": "USDT",
-        "clientOid": order_id
+        "orderId": order_id
     }
     
     body = json.dumps(payload)
@@ -342,11 +342,6 @@ class BitgetWSClient:
             "args": [
                 {
                     "instType": "USDT-FUTURES",
-                    "channel": "orders-algo",
-                    "instId": "default" # 'default' = all Pairs
-                },
-                {
-                    "instType": "USDT-FUTURES",
                     "channel": "orders", 
                     "instId": "default"
                 }
@@ -371,8 +366,6 @@ class BitgetWSClient:
             if str(message).strip() == "pong":
                 logging.debug("Pong received")
                 continue
-
-            logging.info(f"WS RAW MSG: {message}")
             
             try:
                 data = json.loads(message)
@@ -1006,7 +999,6 @@ async def place_conditional_order(symbol, size, trigger_price, side: str, is_sl:
             data = resp.json()
             
             if data.get("code") == "00000":
-                data["data"]["clientOid"] = client_oid 
                 return data
             else:
                 logging.error(f"[ERROR] API Response: {data}")
@@ -1120,7 +1112,7 @@ async def place_bitget_trade(signal, test_mode=True):
     sl_order_id = None
     if sl_resp and "data" in sl_resp:
         sl_success = True
-        sl_order_id = sl_resp["data"].get("clientOid")
+        sl_order_id = sl_resp["data"].get("orderId")
 
     # --- 3. Take-Profit Orders ---
     metadata = await get_symbol_metadata(symbol.replace("_UMCBL", ""))
@@ -1161,7 +1153,7 @@ async def place_bitget_trade(signal, test_mode=True):
             is_sl=False # Marks as TP -> orderType="limit"
         )
         if tp_resp and "data" in tp_resp:
-            tp_ids[i] = tp_resp["data"].get("clientOid")
+            tp_ids[i] = tp_resp["data"].get("orderId")
 
         success = bool(tp_resp)
         tp_success_list.append(success)
