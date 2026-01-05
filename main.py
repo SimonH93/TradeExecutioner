@@ -367,6 +367,8 @@ class BitgetWSClient:
                 logging.debug("Pong received")
                 continue
             
+            logging.info(f"WS RAW MSG: {message}")
+
             try:
                 data = json.loads(message)
             except json.JSONDecodeError:
