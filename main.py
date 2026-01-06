@@ -191,10 +191,14 @@ async def handle_tp_trigger(triggered_order_id, symbol):
     # 4. Neuen SL mit REST-Menge setzen
     remaining_size = calculate_remaining_size(trade_signal)
     if remaining_size > 0 and new_sl_price:
-        side = "buy" if trade_signal.position_type.lower() == "short" else "sell"
+        if trade_signal.position_type.lower() == "long":
+            side = "close_long"
+        else:
+            side = "close_short"
         sl_resp = await place_conditional_order(symbol, remaining_size, new_sl_price, side, is_sl=True)
         if sl_resp and "data" in sl_resp:
             trade_signal.sl_order_id = sl_resp["data"]["orderId"]
+            logging.info(f"Neuer SL gesetzt: {new_sl_price} (Menge: {remaining_size})")
 
     await asyncio.to_thread(update_trade_db, trade_signal)
     
