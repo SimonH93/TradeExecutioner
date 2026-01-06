@@ -166,21 +166,20 @@ async def handle_tp_trigger(triggered_order_id, symbol):
     
     # 1. Trade in DB finden (mit Retry falls DB langsam)
     trade_signal = None
-    for _ in range(3):
-        trade_signal = await asyncio.to_thread(find_trade_by_tp_id, triggered_order_id)
-        if trade_signal: break
-        await asyncio.sleep(1)
+    trade_signal = await asyncio.to_thread(find_trade_by_tp_id, triggered_order_id)
 
     if not trade_signal:
         logging.warning("Kein Trade zu diesem TP gefunden.")
         return
+    
+    logging.info(f"TP getroffen für Trade ID: {trade_signal.id} ({symbol})")
 
     # 2. Status setzen & neuen SL Preis bestimmen
     new_sl_price = None
     if triggered_order_id == trade_signal.tp1_order_id:
         trade_signal.tp1_reached = True
         new_sl_price = trade_signal.entry_price # SL auf Break-Even
-    elif triggered_order_id == trade_signal.tp1_order_id:
+    elif triggered_order_id == trade_signal.tp2_order_id:
         trade_signal.tp2_reached = True
         new_sl_price = trade_signal.tp1_price # SL auf TP1-Niveau
 
