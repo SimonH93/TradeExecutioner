@@ -176,19 +176,38 @@ async def handle_tp_trigger(triggered_order_id, symbol):
 
     # 2. Status setzen & neuen SL Preis bestimmen
     new_sl_price = None
+    update_field = None
     if triggered_order_id == trade_signal.tp1_order_id:
-        trade_signal.tp1_reached = True
-        new_sl_price = trade_signal.entry_price # SL auf Break-Even
+        update_field = "tp1_reached"
+        new_sl_price = trade_signal.entry_price 
+        logging.info("TP1 erreicht -> Verschiebe SL auf Break-Even.")
+        
     elif triggered_order_id == trade_signal.tp2_order_id:
-        trade_signal.tp2_reached = True
-        new_sl_price = trade_signal.tp1_price # SL auf TP1-Niveau
+        update_field = "tp2_reached"
+        new_sl_price = trade_signal.tp1_price
+        logging.info("TP2 erreicht -> Verschiebe SL auf TP1.")
+
+    elif triggered_order_id == trade_signal.tp3_order_id:
+         update_field = "tp3_reached"
+         logging.info("TP3 erreicht.")
 
     # 3. NUR den alten SL löschen
+    if update_field:
+        await asyncio.to_thread(update_trade_db, trade_signal.id, update_field)
+
+    if not new_sl_price:
+        return
+
     if trade_signal.sl_order_id:
+        logging.info(f"Lösche alten SL: {trade_signal.sl_order_id}")
         await cancel_plan_order(symbol, trade_signal.sl_order_id)
-        trade_signal.sl_order_id = None
 
     # 4. Neuen SL mit REST-Menge setzen
+    if update_field == "tp1_reached":
+        trade_signal.tp1_reached = True
+    elif update_field == "tp2_reached":
+        trade_signal.tp2_reached = True
+    
     remaining_size = calculate_remaining_size(trade_signal)
     if remaining_size > 0 and new_sl_price:
         if trade_signal.position_type.lower() == "long":
@@ -197,10 +216,11 @@ async def handle_tp_trigger(triggered_order_id, symbol):
             side = "close_short"
         sl_resp = await place_conditional_order(symbol, remaining_size, new_sl_price, side, is_sl=True)
         if sl_resp and "data" in sl_resp:
-            trade_signal.sl_order_id = sl_resp["data"]["orderId"]
-            logging.info(f"Neuer SL gesetzt: {new_sl_price} (Menge: {remaining_size})")
-
-    await asyncio.to_thread(update_trade_db, trade_signal)
+            new_sl_id = sl_resp["data"]["orderId"]
+            logging.info(f"Neuer SL gesetzt: {new_sl_price} (Menge: {remaining_size}) ID: {new_sl_id}")
+            await asyncio.to_thread(update_trade_db, trade_signal.id, "sl_update", new_sl_id)
+    else:
+        logging.info("Restposition ist 0 oder kleiner, kein neuer SL nötig.")
     
 def update_trade_db(signal_id: int, update_field: str, new_sl_id: str = None):
     """Aktualisiert den Status eines Trades in der DB."""
@@ -211,6 +231,8 @@ def update_trade_db(signal_id: int, update_field: str, new_sl_id: str = None):
                 trade.tp1_reached = True
             elif update_field == "tp2_reached":
                 trade.tp2_reached = True
+            elif update_field == "tp3_reached":
+                trade.tp3_reached = True
             elif update_field == "sl_reached":
                 trade.sl_reached = True
             
@@ -454,6 +476,51 @@ async def get_current_price(symbol: str, product_type: str = "USDT-FUTURES") -> 
     except (KeyError, TypeError, ValueError, IndexError) as e:
         logging.error("Unexpected response structure: %s - Error: %s", data, e)
         raise Exception(f"Unexpected response: {data}")
+
+async def get_real_fill_price(symbol: str, order_id: str):
+    url = f"{BASE_URL}/api/v2/mix/order/detail"
+    params = {
+        "symbol": symbol.replace("_UMCBL", ""),
+        "productType": "USDT-FUTURES",
+        "orderId": order_id
+    }
+    
+    for i in range(3):
+        try:
+            timestamp = str(int(time.time() * 1000))
+            # Signatur erstellen (GET request)
+            # Query Params müssen im Request String sein für Signatur bei GET? 
+            # Bitget V2 GET Params sind Teil der URL, aber requests lib handled das.
+            # Für Signatur bei GET: timestamp + method + path + ?query
+            query_string = f"symbol={params['symbol']}&productType={params['productType']}&orderId={params['orderId']}"
+            sign_path = f"/api/v2/mix/order/detail?{query_string}"
+            
+            signature = sign_request("GET", sign_path, timestamp, "")
+            
+            headers = {
+                "ACCESS-KEY": BITGET_API_KEY,
+                "ACCESS-SIGN": signature,
+                "ACCESS-TIMESTAMP": timestamp,
+                "ACCESS-PASSPHRASE": BITGET_PASSWORD,
+                "Content-Type": "application/json"
+            }
+            
+            async with httpx.AsyncClient(timeout=5) as client:
+                full_url = f"{BASE_URL}{sign_path}"
+                resp = await client.get(full_url, headers=headers)
+                data = resp.json()
+                
+                if data.get("code") == "00000" and "data" in data:
+                    price_avg = data["data"].get("priceAvg")
+                    if price_avg and float(price_avg) > 0:
+                        return float(price_avg)
+        except Exception as e:
+            logging.warning(f"Versuch {i+1} Real Price zu holen fehlgeschlagen: {e}")
+        
+        await asyncio.sleep(0.4) 
+        
+    return None
+
 
 async def get_symbol_metadata(base_symbol: str) -> dict:
     global SYMBOL_INFO_CACHE
@@ -1065,11 +1132,25 @@ async def place_bitget_trade(signal, test_mode=True):
         return
     
     market_success = True
-    total_size = float(initial_position_size)
+    total_size = float(final_position_size)
     signal["position_size"] = final_position_size
     base_symbol = symbol.replace("_UMCBL", "")
     final_tp_sizes = await recalculate_tp_sizes(final_position_size, base_symbol)
     signal["tp_sizes"] = final_tp_sizes 
+
+    real_entry_price = None
+    if market_order_resp and "data" in market_order_resp:
+        market_success = True
+        market_order_id = market_order_resp["data"].get("orderId")
+        logging.info(f"Market Order platziert: {market_order_id}")
+
+        if market_order_id:
+            real_entry_price = await get_real_fill_price(symbol, market_order_id)
+
+    if real_entry_price:
+        logging.info(f"Überschreibe Signal-Entry {entry_price} mit echtem Fill: {real_entry_price}")
+        entry_price = real_entry_price
+        signal["entry"] = real_entry_price
 
     full_sizes = final_tp_sizes
     all_tp_data = [] 
