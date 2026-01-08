@@ -1138,6 +1138,7 @@ async def place_bitget_trade(signal, test_mode=True):
     final_tp_sizes = await recalculate_tp_sizes(final_position_size, base_symbol)
     signal["tp_sizes"] = final_tp_sizes 
 
+    entry_price = signal["entry"]
     real_entry_price = None
     if market_order_resp and "data" in market_order_resp:
         market_success = True
@@ -1149,7 +1150,6 @@ async def place_bitget_trade(signal, test_mode=True):
 
     if real_entry_price:
         logging.info(f"Überschreibe Signal-Entry {entry_price} mit echtem Fill: {real_entry_price}")
-        entry_price = real_entry_price
         signal["entry"] = real_entry_price
 
     full_sizes = final_tp_sizes
