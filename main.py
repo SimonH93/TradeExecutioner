@@ -201,26 +201,34 @@ async def handle_tp_trigger(triggered_order_id, symbol):
     if trade_signal.sl_order_id:
         logging.info(f"Lösche alten SL: {trade_signal.sl_order_id}")
         await cancel_plan_order(symbol, trade_signal.sl_order_id)
+        await asyncio.sleep(0.5)
+
 
     # 4. Neuen SL mit REST-Menge setzen
     if update_field == "tp1_reached":
         trade_signal.tp1_reached = True
     elif update_field == "tp2_reached":
         trade_signal.tp2_reached = True
-    
-    remaining_size = calculate_remaining_size(trade_signal)
-    if remaining_size > 0 and new_sl_price:
+
+    remaining_size = await get_current_position_size(symbol, trade_signal.position_type)
+    logging.info(f"Echte verbleibende Position von API: {remaining_size}")
+
+    if remaining_size > 0:
         if trade_signal.position_type.lower() == "long":
             side = "close_long"
         else:
             side = "close_short"
+            
         sl_resp = await place_conditional_order(symbol, remaining_size, new_sl_price, side, is_sl=True)
+        
         if sl_resp and "data" in sl_resp:
             new_sl_id = sl_resp["data"]["orderId"]
             logging.info(f"Neuer SL gesetzt: {new_sl_price} (Menge: {remaining_size}) ID: {new_sl_id}")
+            
+            # Neue SL ID in DB speichern
             await asyncio.to_thread(update_trade_db, trade_signal.id, "sl_update", new_sl_id)
     else:
-        logging.info("Restposition ist 0 oder kleiner, kein neuer SL nötig.")
+        logging.warning("Restposition ist 0 (laut API), kein neuer SL gesetzt.")
     
 def update_trade_db(signal_id: int, update_field: str, new_sl_id: str = None):
     """Aktualisiert den Status eines Trades in der DB."""
@@ -521,6 +529,48 @@ async def get_real_fill_price(symbol: str, order_id: str):
         
     return None
 
+async def get_current_position_size(symbol: str, position_type: str) -> float:
+    url = f"{BASE_URL}/api/v2/mix/position/single-position"
+    params = {
+        "symbol": symbol.replace("_UMCBL", ""),
+        "productType": "USDT-FUTURES",
+        "marginCoin": "USDT"
+    }
+
+    try:
+        timestamp = str(int(time.time() * 1000))
+        query_string = f"symbol={params['symbol']}&productType={params['productType']}&marginCoin={params['marginCoin']}"
+        sign_path = f"/api/v2/mix/position/single-position?{query_string}"
+        signature = sign_request("GET", sign_path, timestamp, "")
+
+        headers = {
+            "ACCESS-KEY": BITGET_API_KEY,
+            "ACCESS-SIGN": signature,
+            "ACCESS-TIMESTAMP": timestamp,
+            "ACCESS-PASSPHRASE": BITGET_PASSWORD,
+            "Content-Type": "application/json"
+        }
+
+        async with httpx.AsyncClient(timeout=5) as client:
+            full_url = f"{BASE_URL}{sign_path}"
+            resp = await client.get(full_url, headers=headers)
+            data = resp.json()
+            
+            if data.get("code") == "00000" and "data" in data:
+                positions = data["data"]
+                # Wir suchen die Position, die zu unserem Typ (LONG/SHORT) passt
+                target_side = "long" if position_type.lower() == "long" else "short"
+                
+                for pos in positions:
+                    # Bitget V2 gibt holdSide als 'long' oder 'short' zurück
+                    if pos.get("holdSide") == target_side:
+                        # 'total' ist die Gesamtgröße der Position
+                        return float(pos.get("total", 0.0))
+                        
+    except Exception as e:
+        logging.error(f"Fehler beim Abrufen der Positionsgröße: {e}")
+    
+    return 0.0
 
 async def get_symbol_metadata(base_symbol: str) -> dict:
     global SYMBOL_INFO_CACHE
@@ -1141,7 +1191,6 @@ async def place_bitget_trade(signal, test_mode=True):
     entry_price = signal["entry"]
     real_entry_price = None
     if market_order_resp and "data" in market_order_resp:
-        market_success = True
         market_order_id = market_order_resp["data"].get("orderId")
         logging.info(f"Market Order platziert: {market_order_id}")
 
