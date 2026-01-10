@@ -112,6 +112,7 @@ if DATABASE_URL:
         tp2_reached = Column(Boolean, default=False)
         tp3_reached = Column(Boolean, default=False)
         sl_reached = Column(Boolean, default=False)
+        sl_moved_to_be = Column(Boolean, default=False)
         tp1_order_placed = Column(Boolean, default=False)
         tp2_order_placed = Column(Boolean, default=False)
         tp3_order_placed = Column(Boolean, default=False)
@@ -164,71 +165,150 @@ def read_root():
 async def handle_tp_trigger(triggered_order_id, symbol):
     logging.info(f"[TP TRIGGER] Verarbeite Trigger: {triggered_order_id}")
     
-    # 1. Trade in DB finden (mit Retry falls DB langsam)
-    trade_signal = None
-    trade_signal = await asyncio.to_thread(find_trade_by_tp_id, triggered_order_id)
+    # 1. Find Trade in DB
+    trade = await asyncio.to_thread(find_trade_by_tp_id, triggered_order_id)
 
-    if not trade_signal:
+    if not trade:
         logging.warning("Kein Trade zu diesem TP gefunden.")
         return
-    
-    logging.info(f"TP getroffen für Trade ID: {trade_signal.id} ({symbol})")
 
-    # 2. Status setzen & neuen SL Preis bestimmen
-    new_sl_price = None
-    update_field = None
-    if triggered_order_id == trade_signal.tp1_order_id:
-        update_field = "tp1_reached"
-        new_sl_price = trade_signal.entry_price 
-        logging.info("TP1 erreicht -> Verschiebe SL auf Break-Even.")
+    # --- Special Case: SL was hit ---
+    if triggered_order_id == trade.sl_order_id:
+        logging.info(f"🛑 STOP LOSS hit for Trade {trade.id} ({symbol}).")
         
-    elif triggered_order_id == trade_signal.tp2_order_id:
-        update_field = "tp2_reached"
-        new_sl_price = trade_signal.tp1_price
-        logging.info("TP2 erreicht -> Verschiebe SL auf TP1.")
-
-    elif triggered_order_id == trade_signal.tp3_order_id:
-         update_field = "tp3_reached"
-         logging.info("TP3 erreicht.")
-
-    # 3. NUR den alten SL löschen
-    if update_field:
-        await asyncio.to_thread(update_trade_db, trade_signal.id, update_field)
-
-    if not new_sl_price:
+        # DB Update: SL reached, trade inactive
+        updates = {
+            "sl_reached": True,
+            "is_active": False
+        }
+        await asyncio.to_thread(update_trade_db_fields, trade.id, updates)
+        
+        # clean up all TPs
+        ids_to_cancel = []
+        if trade.tp1_order_id and not trade.tp1_reached: ids_to_cancel.append(trade.tp1_order_id)
+        if trade.tp2_order_id and not trade.tp2_reached: ids_to_cancel.append(trade.tp2_order_id)
+        if trade.tp3_order_id and not trade.tp3_reached: ids_to_cancel.append(trade.tp3_order_id)
+        
+        if ids_to_cancel:
+            logging.info(f"SL Hit Cleanup: Deleting open TPs {ids_to_cancel}...")
+            for oid in ids_to_cancel:
+                await cancel_plan_order(symbol, oid)
+                await asyncio.sleep(0.1)
+        
         return
 
-    if trade_signal.sl_order_id:
-        logging.info(f"Lösche alten SL: {trade_signal.sl_order_id}")
-        await cancel_plan_order(symbol, trade_signal.sl_order_id)
-        await asyncio.sleep(0.5)
-
-
-    # 4. Neuen SL mit REST-Menge setzen
-    if update_field == "tp1_reached":
-        trade_signal.tp1_reached = True
-    elif update_field == "tp2_reached":
-        trade_signal.tp2_reached = True
-
-    remaining_size = await get_current_position_size(symbol, trade_signal.position_type)
-    logging.info(f"Echte verbleibende Position von API: {remaining_size}")
-
-    if remaining_size > 0:
-        if trade_signal.position_type.lower() == "long":
-            side = "close_long"
-        else:
-            side = "close_short"
-            
-        sl_resp = await place_conditional_order(symbol, remaining_size, new_sl_price, side, is_sl=True)
-        
-        if sl_resp and "data" in sl_resp:
-            new_sl_id = sl_resp["data"]["orderId"]
-            logging.info(f"Neuer SL gesetzt: {new_sl_price} (Menge: {remaining_size}) ID: {new_sl_id}")
-            
-            # Neue SL ID in DB speichern
-            await asyncio.to_thread(update_trade_db, trade_signal.id, "sl_update", new_sl_id)
+    # 2. Check which TP was hit
+    hit_tp_level = 0
+    if triggered_order_id == trade.tp1_order_id:
+        hit_tp_level = 1
+        logging.info(f"TP1 getroffen (Trade {trade.id}).")
+    elif triggered_order_id == trade.tp2_order_id:
+        hit_tp_level = 2
+        logging.info(f"TP2 getroffen (Trade {trade.id}).")
+    elif triggered_order_id == trade.tp3_order_id:
+        hit_tp_level = 3
+        logging.info(f"TP3 getroffen (Trade {trade.id}).")
     else:
-        logging.warning("Restposition ist 0 (laut API), kein neuer SL gesetzt.")
+        logging.warning("Getriggerte Order ID passt zu keinem bekannten TP.")
+        return
+
+    # 3. Clean up: delete all open orders
+    ids_to_cancel = []
+    
+    if trade.sl_order_id:
+        ids_to_cancel.append(trade.sl_order_id)
+    
+    # If TP1 hit -> delete TP2 and TP3
+    if hit_tp_level < 2 and trade.tp2_order_id:
+        ids_to_cancel.append(trade.tp2_order_id)
+    # If TP1 or TP2 hit -> delete TP3
+    if hit_tp_level < 3 and trade.tp3_order_id:
+        ids_to_cancel.append(trade.tp3_order_id)
+    
+    if ids_to_cancel:
+        logging.info(f"Räume auf: Lösche alte Orders {ids_to_cancel}...")
+        for oid in ids_to_cancel:
+            await cancel_plan_order(symbol, oid)
+            await asyncio.sleep(0.1)
+
+    await asyncio.sleep(0.5)
+
+    # 4. Aktuellen Status ermitteln
+    remaining_size = await get_current_position_size(symbol, trade.position_type)
+    logging.info(f"Echte verbleibende Position nach TP{hit_tp_level}: {remaining_size}")
+
+    # Prepare Update dictionary for DB 
+    updates = {}
+    if hit_tp_level == 1: 
+        updates["tp1_reached"] = True
+        updates["sl_moved_to_be"] = True
+    elif hit_tp_level == 2: 
+        updates["tp2_reached"] = True
+    elif hit_tp_level == 3: 
+        updates["tp3_reached"] = True
+
+    if remaining_size <= 0:
+        logging.info("Position ist komplett geschlossen. Keine neuen Orders nötig.")
+        await asyncio.to_thread(update_trade_db_fields, trade.id, updates)
+        return
+
+    # 5. Get scales for precision
+    base_symbol = symbol.replace("_UMCBL", "")
+    metadata = await get_symbol_metadata(base_symbol)
+    size_scale = metadata.get("sizeScale", 2)
+
+    # 6. Calculate new Stop Loss and set it
+    new_sl_price = None
+    if hit_tp_level == 1:
+        new_sl_price = trade.entry_price # Break Even
+    elif hit_tp_level == 2:
+        new_sl_price = trade.tp1_price # Trail to TP1
+    
+    side = "close_long" if trade.position_type.upper() == "LONG" else "close_short"
+
+    if new_sl_price:
+        logging.info(f"Setze neuen SL auf {new_sl_price} für Menge {remaining_size}")
+        sl_resp = await place_conditional_order(symbol, remaining_size, new_sl_price, side, is_sl=True)
+        if sl_resp and "data" in sl_resp:
+            updates["sl_order_id"] = sl_resp["data"]["orderId"]
+    
+    current_pool_size = remaining_size
+    
+    # -- TP2 ressurection --
+    if hit_tp_level < 2 and trade.tp2_price:
+        target_tp2_size = float(trade.total_size) * TP_SPLIT_PERCENTAGES[1]
+        target_tp2_size = round(target_tp2_size, size_scale)
+        
+        # Safety Check
+        tp2_size = min(target_tp2_size, current_pool_size)
+        
+        # If there is no TP3, TP2 takes the remaining size
+        if not trade.tp3_price:
+            tp2_size = current_pool_size
+
+        if tp2_size > 0:
+            logging.info(f"Setze TP2 neu: {trade.tp2_price} Menge: {tp2_size}")
+            tp2_resp = await place_conditional_order(symbol, tp2_size, trade.tp2_price, side, is_sl=False)
+            
+            if tp2_resp and "data" in tp2_resp:
+                updates["tp2_order_id"] = tp2_resp["data"]["orderId"]
+                current_pool_size -= tp2_size
+
+    # -- TP3 ressurection --
+    # only if TP1 and TP2 hit and TP3 originally defined
+    if hit_tp_level < 3 and trade.tp3_price:
+        # TP3 always takes the rest
+        tp3_size = round(current_pool_size, size_scale)
+        
+        if tp3_size > 0:
+            logging.info(f"Setze TP3 neu: {trade.tp3_price} Menge: {tp3_size}")
+            tp3_resp = await place_conditional_order(symbol, tp3_size, trade.tp3_price, side, is_sl=False)
+            
+            if tp3_resp and "data" in tp3_resp:
+                updates["tp3_order_id"] = tp3_resp["data"]["orderId"]
+
+    # 8. DB Update
+    await asyncio.to_thread(update_trade_db_fields, trade.id, updates)
     
 def update_trade_db(signal_id: int, update_field: str, new_sl_id: str = None):
     """Aktualisiert den Status eines Trades in der DB."""
@@ -249,6 +329,24 @@ def update_trade_db(signal_id: int, update_field: str, new_sl_id: str = None):
             
             db.commit()
             logging.info(f"DB Update for Trade {signal_id}: {update_field} marked.")
+
+def update_trade_db_fields(signal_id: int, updates: dict):
+    """
+    Aktualisiert beliebige Felder eines Trades basierend auf einem Dictionary.
+    Beispiel updates: {"sl_order_id": "123", "tp1_reached": True}
+    """
+    with get_db() as db:
+        trade = db.query(TradingSignal).filter(TradingSignal.id == signal_id).first()
+        if trade:
+            for key, value in updates.items():
+                if hasattr(trade, key):
+                    setattr(trade, key, value)
+                else:
+                    logging.warning(f"DB Update Warning: Feld '{key}' existiert nicht im Model.")
+            
+            db.commit()
+            logging.info(f"DB Update for Trade {signal_id}: {list(updates.keys())} updated.")
+
 
 async def cancel_plan_order(symbol: str, order_id: str):
     """Storniert eine bestehende Plan-Order (SL oder TP)."""
@@ -309,7 +407,8 @@ def find_trade_by_tp_id(order_id):
         return db.query(TradingSignal).filter(
             (TradingSignal.tp1_order_id == order_id) |
             (TradingSignal.tp2_order_id == order_id) |
-            (TradingSignal.tp3_order_id == order_id)
+            (TradingSignal.tp3_order_id == order_id) |
+            (TradingSignal.sl_order_id == order_id)
         ).first()
 
 # Globale Variable für die Verbindung
@@ -369,7 +468,6 @@ class BitgetWSClient:
         logging.info("Login request sent.")
 
     async def _subscribe(self, ws):
-        # 'orders-algo' for Plan Orders (TP/SL)
         sub_msg = {
             "op": "subscribe",
             "args": [
