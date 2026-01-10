@@ -39,6 +39,7 @@ BITGET_PASSWORD = os.getenv("BITGET_PASSWORD")
 
 USDT_BUDGET = float(os.getenv("BITGET_USDT_SIZE") or 10)
 DEFAULT_LEVERAGE = float(os.getenv("BITGET_LEVERAGE", 1))
+MIN_TP1_ROI = float(os.getenv("MIN_TP1_ROI_PERCENT") or 10) / 100
 TEST_MODE = os.getenv("BITGET_TEST_MODE", "True").lower() == "true"
 
 # Base URL for Bitget Futures
@@ -923,10 +924,8 @@ async def parse_signal(text: str):
             else: # SHORT
                 roi_tp1 = ((entry_price - tp1) / entry_price) * leverage
 
-            logging.info(f"Check ROI für TP1: {roi_tp1:.2%}")
-
             # ROI needs to be at least 10%
-            if roi_tp1 < 0.10:
+            if roi_tp1 < MIN_TP1_ROI:
                 logging.warning(f"Trade rejected: TP1 ROI ({roi_tp1:.2%}) is less than 10%.")
                 return None
 
