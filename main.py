@@ -497,8 +497,6 @@ class BitgetWSClient:
             if str(message).strip() == "pong":
                 logging.debug("Pong received")
                 continue
-            
-            logging.info(f"WS RAW MSG: {message}")
 
             try:
                 data = json.loads(message)
@@ -910,7 +908,32 @@ async def parse_signal(text: str):
 
         if not all([base_symbol, position_type, entry_price, stop_loss, leverage]):
             return None  # Required fields missing
+              
         
+        try:
+            tp1 = signal_tp_prices[0]
+            # Sicherstellen, dass alle Werte vorhanden sind
+            if not entry_price or not tp1 or not leverage:
+                logging.warning("Mindestdaten für ROI-Check fehlen.")
+                return None
+
+            # ROI Check - min 10% between TP1 and Entry
+            if position_type.upper() == "LONG":
+                roi_tp1 = ((tp1 - entry_price) / entry_price) * leverage
+            else: # SHORT
+                roi_tp1 = ((entry_price - tp1) / entry_price) * leverage
+
+            logging.info(f"Check ROI für TP1: {roi_tp1:.2%}")
+
+            # ROI needs to be at least 10%
+            if roi_tp1 < 0.10:
+                logging.warning(f"Trade rejected: TP1 ROI ({roi_tp1:.2%}) is less than 10%.")
+                return None
+
+        except Exception as e:
+            logging.error(f"Error in ROI-Check: {e}")
+            return None
+
         current_price = await get_current_price(base_symbol)
         # Calculate position + TP split
         position_size, tp_sizes = await get_position_size(base_symbol, leverage=leverage)
@@ -919,8 +942,8 @@ async def parse_signal(text: str):
 
         if not validate_trade(position_type, stop_loss, take_profits, current_price):
             logging.info(f"[DEBUG] Current={current_price}, SL={stop_loss}, TP_min={min(take_profits)}, TP_max={max(take_profits)}")
-            return None        
-        
+            return None  
+
         return {
             "symbol": trading_symbol,
             "position_size": position_size,
