@@ -250,6 +250,7 @@ async def handle_tp_trigger(triggered_order_id, symbol):
 
     if remaining_size <= 0:
         logging.info("Position ist komplett geschlossen. Keine neuen Orders nötig.")
+        updates["is_active"] = False
         await asyncio.to_thread(update_trade_db_fields, trade.id, updates)
         return
 
