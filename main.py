@@ -40,6 +40,7 @@ BITGET_PASSWORD = os.getenv("BITGET_PASSWORD")
 USDT_BUDGET = float(os.getenv("BITGET_USDT_SIZE") or 10)
 DEFAULT_LEVERAGE = float(os.getenv("BITGET_LEVERAGE", 1))
 MIN_TP1_ROI = float(os.getenv("MIN_TP1_ROI_PERCENT") or 10) / 100
+MIN_RR_RATIO = float(os.getenv("MIN_RR_RATIO", 0.2))
 TEST_MODE = os.getenv("BITGET_TEST_MODE", "True").lower() == "true"
 
 # Base URL for Bitget Futures
@@ -914,7 +915,6 @@ async def parse_signal(text: str):
         
         try:
             tp1 = signal_tp_prices[0]
-            # Sicherstellen, dass alle Werte vorhanden sind
             if not entry_price or not tp1 or not leverage:
                 logging.warning("Mindestdaten für ROI-Check fehlen.")
                 return None
@@ -929,9 +929,31 @@ async def parse_signal(text: str):
             if roi_tp1 < MIN_TP1_ROI:
                 logging.warning(f"Trade rejected: TP1 ROI ({roi_tp1:.2%}) is less than 10%.")
                 return None
+            
+            # Risk Reward Check
+            reward = 0.0
+            risk = 0.0
+
+            if position_type.upper() == "LONG":
+                reward = tp1 - entry_price
+                risk = entry_price - stop_loss
+            else: # SHORT
+                reward = entry_price - tp1
+                risk = stop_loss - entry_price
+
+            if risk <= 0:
+                logging.warning(f"❌ Trade abgelehnt: Ungültiges Risiko (Risk <= 0). SL liegt falsch im Vergleich zum Entry.")
+                return None
+            
+            rr_ratio = reward / risk
+
+            if MIN_RR_RATIO > 0:
+                if rr_ratio < MIN_RR_RATIO:
+                    logging.warning(f"❌ Trade abgelehnt: RRR ({rr_ratio:.2f}) ist zu schlecht. Minimum ist {MIN_RR_RATIO}.")
+                    return None
 
         except Exception as e:
-            logging.error(f"Error in ROI-Check: {e}")
+            logging.error(f"Error in ROI and R/R-Check: {e}")
             return None
 
         current_price = await get_current_price(base_symbol)
