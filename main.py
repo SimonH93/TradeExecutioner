@@ -194,7 +194,7 @@ async def handle_tp_trigger(triggered_order_id, symbol):
         if ids_to_cancel:
             logging.info(f"SL Hit Cleanup: Deleting open TPs {ids_to_cancel}...")
             for oid in ids_to_cancel:
-                await cancel_plan_order(symbol, oid)
+                await cancel_regular_order(symbol, oid)
                 await asyncio.sleep(0.1)
         
         return
@@ -215,22 +215,27 @@ async def handle_tp_trigger(triggered_order_id, symbol):
         return
 
     # 3. Clean up: delete all open orders
-    ids_to_cancel = []
-    
+    tps_to_cancel = []
+    sl_to_cancel = None
+
     if trade.sl_order_id:
-        ids_to_cancel.append(trade.sl_order_id)
+        sl_to_cancel = trade.sl_order_id
     
     # If TP1 hit -> delete TP2 and TP3
     if hit_tp_level < 2 and trade.tp2_order_id:
-        ids_to_cancel.append(trade.tp2_order_id)
+        tps_to_cancel.append(trade.tp2_order_id)
     # If TP1 or TP2 hit -> delete TP3
     if hit_tp_level < 3 and trade.tp3_order_id:
-        ids_to_cancel.append(trade.tp3_order_id)
+        tps_to_cancel.append(trade.tp3_order_id)
     
-    if ids_to_cancel:
-        logging.info(f"Räume auf: Lösche alte Orders {ids_to_cancel}...")
-        for oid in ids_to_cancel:
-            await cancel_plan_order(symbol, oid)
+    if sl_to_cancel:
+        logging.info(f"Verschiebe/Lösche alten SL (Plan Order): {sl_to_cancel}")
+        await cancel_plan_order(symbol, sl_to_cancel)
+
+    if tps_to_cancel:
+        logging.info(f"Lösche alte TP Limit Orders für Neuberechnung: {tps_to_cancel}")
+        for oid in tps_to_cancel:
+            await cancel_regular_order(symbol, oid)
             await asyncio.sleep(0.1)
 
     await asyncio.sleep(0.5)
@@ -271,7 +276,7 @@ async def handle_tp_trigger(triggered_order_id, symbol):
 
     if new_sl_price:
         logging.info(f"Setze neuen SL auf {new_sl_price} für Menge {remaining_size}")
-        sl_resp = await place_conditional_order(symbol, remaining_size, new_sl_price, side, is_sl=True)
+        sl_resp = await place_stop_loss_order(symbol, remaining_size, new_sl_price, side, is_sl=True)
         if sl_resp and "data" in sl_resp:
             updates["sl_order_id"] = sl_resp["data"]["orderId"]
     
@@ -291,7 +296,7 @@ async def handle_tp_trigger(triggered_order_id, symbol):
 
         if tp2_size > 0:
             logging.info(f"Setze TP2 neu: {trade.tp2_price} Menge: {tp2_size}")
-            tp2_resp = await place_conditional_order(symbol, tp2_size, trade.tp2_price, side, is_sl=False)
+            tp2_resp = await place_take_profit_order(symbol, tp2_size, trade.tp2_price, side)
             
             if tp2_resp and "data" in tp2_resp:
                 updates["tp2_order_id"] = tp2_resp["data"]["orderId"]
@@ -305,7 +310,7 @@ async def handle_tp_trigger(triggered_order_id, symbol):
         
         if tp3_size > 0:
             logging.info(f"Setze TP3 neu: {trade.tp3_price} Menge: {tp3_size}")
-            tp3_resp = await place_conditional_order(symbol, tp3_size, trade.tp3_price, side, is_sl=False)
+            tp3_resp = await place_take_profit_order(symbol, tp3_size, trade.tp3_price, side)
             
             if tp3_resp and "data" in tp3_resp:
                 updates["tp3_order_id"] = tp3_resp["data"]["orderId"]
@@ -389,6 +394,53 @@ async def cancel_plan_order(symbol: str, order_id: str):
     except Exception as e:
         logging.error(f"Error calling cancel-plan-order: {e}")
         return False
+
+
+async def cancel_regular_order(symbol: str, order_id: str):
+    """
+    Storniert eine reguläre Limit- oder Market-Order (keine Plan-Order).
+    Wird für die neuen Take Profits benötigt.
+    """
+    url_path = "/api/v2/mix/order/cancel-order"
+    url = f"{BASE_URL}{url_path}"
+    timestamp = str(int(time.time() * 1000))
+    
+    # Basis-Symbol extrahieren (z.B. BTCUSDT)
+    base_symbol = symbol.replace("_UMCBL", "")
+
+    payload = {
+        "symbol": base_symbol,
+        "productType": "USDT-FUTURES",
+        "marginCoin": "USDT",
+        "orderId": order_id
+    }
+    
+    body = json.dumps(payload)
+    signature = sign_request("POST", url_path, timestamp, body)
+    
+    headers = {
+        "ACCESS-KEY": BITGET_API_KEY,
+        "ACCESS-SIGN": signature,
+        "ACCESS-TIMESTAMP": timestamp,
+        "ACCESS-PASSPHRASE": BITGET_PASSWORD,
+        "Content-Type": "application/json"
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=5) as client:
+            resp = await client.post(url, headers=headers, data=body)
+            data = resp.json()
+            # Code 45110 = Order not found (bereits gefüllt/storniert), das werten wir als "Erfolg" beim Aufräumen
+            if data.get("code") == "00000" or data.get("code") == "45110":
+                logging.info(f"Successfully cancelled Regular Order: {order_id}")
+                return True
+            else:
+                logging.error(f"Failed to cancel Regular Order {order_id}: {data}")
+                return False
+    except Exception as e:
+        logging.error(f"Error calling cancel-regular-order: {e}")
+        return False
+    
 
 def calculate_remaining_size(trade_signal):
     """
@@ -1197,13 +1249,88 @@ async def place_market_order(symbol, size, side, leverage=10, retry_count=0):
         # Catches network errors or timeouts
         logging.error("[ERROR] Market Order Request failed (network/timeout): %s", e)
         return None
+
+
+async def place_take_profit_order(symbol, size, price, side):
+    """
+    Platziert eine LIMIT Order, um Profit zu nehmen.
+    Nutzt den Standard 'place-order' Endpoint, damit die Order im Orderbuch steht.
+    """
+    url_path = "/api/v2/mix/order/place-order"
+    url = f"{BASE_URL}{url_path}"
+    timestamp = str(int(time.time() * 1000))
     
-async def place_conditional_order(symbol, size, trigger_price, side: str, is_sl: bool):
+    # Generiere eine eindeutige Client ID für TPs
+    client_oid = f"tp_{int(time.time() * 1000)}_{os.urandom(2).hex()}"
+
+    # Metadaten für Präzision holen
+    base_symbol = symbol.replace("_UMCBL", "")
+    metadata = await get_symbol_metadata(base_symbol)
+    size_scale = metadata.get("sizeScale", 4)
+    price_scale = metadata.get("priceScale", 4)
+    
+    formatted_size = format(float(size), f".{size_scale}f")
+    formatted_price = format(float(price), f".{price_scale}f")
+
+    # Bitget V2 Hedge Mode Logik:
+    # side = "buy" meint hier die LONG-Seite der Position
+    # side = "sell" meint hier die SHORT-Seite der Position
+    # tradeSide = "close" sorgt dafür, dass die Position geschlossen wird.
+    if side == "close_long":
+        v2_side = "buy"   # Wir schließen die BUY (Long) Seite
+    elif side == "close_short":
+        v2_side = "sell"  # Wir schließen die SELL (Short) Seite
+    else:
+        logging.error(f"Invalid side for Take Profit: {side}. Expected 'close_long' or 'close_short'.")
+        return None
+
+    payload = {
+        "symbol": base_symbol,
+        "productType": "UMCBL",
+        "marginMode": "isolated", # Konsistent mit SL/TP Logik
+        "marginCoin": "USDT",
+        "size": formatted_size,
+        "price": formatted_price, # Pflichtfeld bei Limit Orders [cite: 16]
+        "side": v2_side,          # Richtung der Position (Long/Short) 
+        "tradeSide": "close",     # WICHTIG: Wir schließen die Position
+        "orderType": "limit",     # TP soll im Buch stehen
+        "force": "gtc",           # Good till canceled [cite: 18]
+        "clientOid": client_oid
+    }
+
+    body = json.dumps(payload)
+    signature = sign_request("POST", url_path, timestamp, body)
+
+    headers = {
+        "ACCESS-KEY": BITGET_API_KEY,
+        "ACCESS-SIGN": signature,
+        "ACCESS-TIMESTAMP": timestamp,
+        "ACCESS-PASSPHRASE": BITGET_PASSWORD,
+        "Content-Type": "application/json"
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=5) as client:
+            resp = await client.post(url, headers=headers, data=body)
+            data = resp.json()
+            
+            if data.get("code") == "00000":
+                logging.info(f"TP Limit Order placed successfully: {formatted_price} (Size: {formatted_size})")
+                return data
+            else:
+                logging.error(f"[ERROR] TP Order Response: {data} Payload: {payload}")
+                return None
+
+    except Exception as e:
+        logging.error(f"[ERROR] TP Request failed: {e}")
+        return None
+
+
+async def place_stop_loss_order(symbol, size, trigger_price, side: str):
     url_path = "/api/v2/mix/order/place-plan-order"
     url = f"{BASE_URL}{url_path}"
     timestamp = str(int(time.time() * 1000))
-    prefix = "sl" if is_sl else "tp"
-    client_oid = f"{prefix}_{int(time.time() * 1000)}_{os.urandom(2).hex()}"
+    client_oid = f"sl_{int(time.time() * 1000)}_{os.urandom(2).hex()}"
     if side == "close_long":
         v2_side = "buy"
     elif side == "close_short":
@@ -1219,15 +1346,6 @@ async def place_conditional_order(symbol, size, trigger_price, side: str, is_sl:
     formatted_size = format(float(size), f".{size_scale}f")
     formatted_trigger_price = format(float(trigger_price), f".{price_scale}f")
 
-    if is_sl:
-        order_type = "market"
-        execution_price = None 
-    else:
-        # Take-Profit: OrderType ist LIMIT
-        order_type = "limit"
-        # Bei Limit Orders ist der Ausführungspreis gleich dem Trigger-Preis
-        execution_price = formatted_trigger_price
-
     payload = {
         "symbol": base_symbol,
         "productType": "UMCBL",
@@ -1235,7 +1353,7 @@ async def place_conditional_order(symbol, size, trigger_price, side: str, is_sl:
         "marginCoin": "USDT",
         "size": formatted_size,
         "side": v2_side, 
-        "orderType": order_type,
+        "orderType": "market",
         "planType": "normal_plan",
         "tradeSide": "close",
         "reduceOnly": "yes",
@@ -1244,9 +1362,6 @@ async def place_conditional_order(symbol, size, trigger_price, side: str, is_sl:
         "clientOid": client_oid
     }
 
-    if execution_price is not None:
-         payload["price"] = str(execution_price)
-    
     body = json.dumps(payload)
     signature = sign_request("POST", url_path, timestamp, body)
 
@@ -1266,7 +1381,7 @@ async def place_conditional_order(symbol, size, trigger_price, side: str, is_sl:
             if data.get("code") == "00000":
                 return data
             else:
-                logging.error(f"[ERROR] API Response: {data}")
+                logging.error(f"[ERROR] SL API Response: {data}")
                 return None
 
     except Exception as e:
@@ -1379,12 +1494,11 @@ async def place_bitget_trade(signal, test_mode=True):
     await asyncio.sleep(2.0)
 
     # --- 2. Stop-Loss Order ---
-    sl_resp = await place_conditional_order(
+    sl_resp = await place_stop_loss_order(
         symbol=symbol,
         size=final_position_size, 
         trigger_price=sl_price,
-        side=closing_side,
-        is_sl=True # Marks as SL -> orderType="market"
+        side=closing_side
     )
     logging.info("Stop-Loss Plan Order Response: %s", sl_resp)
     sl_order_id = None
@@ -1395,10 +1509,9 @@ async def place_bitget_trade(signal, test_mode=True):
     # --- 3. Take-Profit Orders ---
     metadata = await get_symbol_metadata(symbol.replace("_UMCBL", ""))
     size_scale = metadata.get("sizeScale", 2)
-
     tp_ids = [None, None, None]
     tp_success_list = []
-    accumulated_tp_size = 0.0  # Hier tracken wir, was schon verplant wurde
+    accumulated_tp_size = 0.0
     
     num_tps_to_set = len(tp_prices)
     
@@ -1423,12 +1536,11 @@ async def place_bitget_trade(signal, test_mode=True):
             logging.info(f"TP{i+1} übersprungen (Größe 0 oder kein Preis)")
             continue
         
-        tp_resp = await place_conditional_order(
+        tp_resp = await place_take_profit_order(
             symbol=symbol,
             size=tp_size,
-            trigger_price=tp_price,
-            side=closing_side,
-            is_sl=False # Marks as TP -> orderType="limit"
+            price=tp_price,
+            side=closing_side
         )
         if tp_resp and "data" in tp_resp:
             tp_ids[i] = tp_resp["data"].get("orderId")
