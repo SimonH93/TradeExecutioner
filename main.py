@@ -396,7 +396,7 @@ async def cancel_plan_order(symbol: str, order_id: str):
         return False
 
 
-async def cancel_regular_order(symbol: str, order_id: str):
+async def cancel_regular_order(symbol: str, order_id_or_client_oid: str):
     """
     Storniert eine reguläre Limit- oder Market-Order (keine Plan-Order).
     Wird für die neuen Take Profits benötigt.
@@ -411,10 +411,14 @@ async def cancel_regular_order(symbol: str, order_id: str):
     payload = {
         "symbol": base_symbol,
         "productType": "USDT-FUTURES",
-        "marginCoin": "USDT",
-        "orderId": order_id
+        "marginCoin": "USDT"
     }
     
+    if order_id_or_client_oid.startswith(("tp_", "sl_")):
+        payload["clientOid"] = order_id_or_client_oid
+    else:
+        payload["orderId"] = order_id_or_client_oid
+
     body = json.dumps(payload)
     signature = sign_request("POST", url_path, timestamp, body)
     
@@ -432,10 +436,10 @@ async def cancel_regular_order(symbol: str, order_id: str):
             data = resp.json()
             # Code 45110 = Order not found (bereits gefüllt/storniert), das werten wir als "Erfolg" beim Aufräumen
             if data.get("code") == "00000" or data.get("code") == "45110":
-                logging.info(f"Successfully cancelled Regular Order: {order_id}")
+                logging.info(f"Successfully cancelled Regular Order: {order_id_or_client_oid}")
                 return True
             else:
-                logging.error(f"Failed to cancel Regular Order {order_id}: {data}")
+                logging.error(f"Failed to cancel Regular Order {order_id_or_client_oid}: {data}")
                 return False
     except Exception as e:
         logging.error(f"Error calling cancel-regular-order: {e}")
