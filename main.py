@@ -276,7 +276,7 @@ async def handle_tp_trigger(triggered_order_id, symbol):
 
     if new_sl_price:
         logging.info(f"Setze neuen SL auf {new_sl_price} für Menge {remaining_size}")
-        sl_resp = await place_stop_loss_order(symbol, remaining_size, new_sl_price, side, is_sl=True)
+        sl_resp = await place_stop_loss_order(symbol, remaining_size, new_sl_price, side)
         if sl_resp and "data" in sl_resp:
             updates["sl_order_id"] = sl_resp["data"]["orderId"]
     
