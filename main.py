@@ -585,13 +585,17 @@ class BitgetWSClient:
                 for order in order_data_list:
                     status = order.get("status")
                     if status == "filled":
-                        trigger_id = order.get("clientOid")
+                        client_id = order.get("clientOid")
+                        order_id = order.get("orderId")
                         symbol = order.get("instId")
                         
+                        logging.info(f"ORDER FILLED. ID: {order_id}, ClientID: {client_id}")
+
                         # Wichtig: Prüfen ob trigger_id existiert UND unser Prefix hat (optional, aber sicher)
-                        if trigger_id:
-                            logging.info(f"ORDER FILLED (Status: {status}). Prüfe TP-Trigger für ID: {trigger_id}")
-                            await handle_tp_trigger(trigger_id, symbol)
+                        if client_id:
+                            await handle_tp_trigger(client_id, symbol)
+                        elif order_id:
+                            await handle_tp_trigger(order_id, symbol)
 
 @app.post("/process_signal")
 async def process_router_signal(update: dict):
@@ -1504,7 +1508,7 @@ async def place_bitget_trade(signal, test_mode=True):
     sl_order_id = None
     if sl_resp and "data" in sl_resp:
         sl_success = True
-        sl_order_id = sl_resp["data"].get("orderId")
+        sl_order_id = sl_resp["data"].get("clientOid")
 
     # --- 3. Take-Profit Orders ---
     metadata = await get_symbol_metadata(symbol.replace("_UMCBL", ""))
@@ -1543,7 +1547,7 @@ async def place_bitget_trade(signal, test_mode=True):
             side=closing_side
         )
         if tp_resp and "data" in tp_resp:
-            tp_ids[i] = tp_resp["data"].get("orderId")
+            tp_ids[i] = tp_resp["data"].get("clientOid")
 
         success = bool(tp_resp)
         tp_success_list.append(success)
