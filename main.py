@@ -238,7 +238,7 @@ async def handle_tp_trigger(triggered_order_id, symbol):
             await cancel_regular_order(symbol, oid)
             await asyncio.sleep(0.1)
 
-    await asyncio.sleep(0.5)
+    await asyncio.sleep(2.0)
 
     # 4. Aktuellen Status ermitteln
     remaining_size = await get_current_position_size(symbol, trade.position_type)
