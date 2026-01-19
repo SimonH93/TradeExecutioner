@@ -1335,14 +1335,14 @@ async def place_take_profit_order(symbol, size, price, side):
 
 
 async def place_stop_loss_order(symbol, size, trigger_price, side: str):
-    url_path = "/api/v2/mix/order/place-plan-order"
+    url_path = "/api/v2/mix/order/place-tpsl-order"
     url = f"{BASE_URL}{url_path}"
     timestamp = str(int(time.time() * 1000))
     client_oid = f"sl_{int(time.time() * 1000)}_{os.urandom(2).hex()}"
     if side == "close_long":
-        v2_side = "buy"
+        v2_side = "long"
     elif side == "close_short":
-        v2_side = "sell"
+        v2_side = "short"
     else:
         logging.error("Invalid side for Conditional Order: %s. Expected 'close_long' or 'close_short'.", side)
         return None
@@ -1356,17 +1356,14 @@ async def place_stop_loss_order(symbol, size, trigger_price, side: str):
 
     payload = {
         "symbol": base_symbol,
-        "productType": "UMCBL",
-        "marginMode": "isolated",
+        "productType": "USDT-FUTURES",
+        "planType": "loss_plan",
         "marginCoin": "USDT",
-        "size": formatted_size,
-        "side": v2_side, 
-        "orderType": "market",
-        "planType": "normal_plan",
-        "tradeSide": "close",
-        "reduceOnly": "yes",
         "triggerPrice": formatted_trigger_price,
         "triggerType": "mark_price",
+        "executePrice": "0",
+        "size": formatted_size,
+        "holdSide": v2_side,
         "clientOid": client_oid
     }
 
