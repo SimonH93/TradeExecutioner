@@ -491,10 +491,21 @@ class BitgetWSClient:
         self.running = True
         while self.running:
             try:
-                async with websockets.connect(self.url, ping_interval=20, ping_timeout=20) as websocket:
+                async with websockets.connect(self.url, ping_interval=None) as websocket:
                     logging.info("WebSocket connected.")
                     await self._login(websocket)
-                    await self._listen(websocket)
+                    
+                    # Heartbeat Loop & Listen Loop parallel
+                    listener = asyncio.create_task(self._listen(websocket))
+                    pinger = asyncio.create_task(self._keep_alive(websocket))
+                    
+                    done, pending = await asyncio.wait(
+                        [listener, pinger],
+                        return_when=asyncio.FIRST_COMPLETED,
+                    )
+                    
+                    for task in pending:
+                        task.cancel()
                         
             except Exception as e:
                 logging.error(f"WebSocket connection failed: {e}. Reconnecting in 5s...")
@@ -527,63 +538,68 @@ class BitgetWSClient:
             ]
         }
         await ws.send(json.dumps(sub_msg))
-        logging.info("Subscribe request sent to orders.")
+        logging.info("Subscribe request sent to orders-algo.")
+
+    async def _keep_alive(self, ws):
+        """Sendet 'ping' alle 20 Sekunden"""
+        while True:
+            await asyncio.sleep(20)
+            try:
+                await ws.send("ping")
+                logging.debug("Ping sent")
+            except Exception as e:
+                    logging.error(f"Error sending ping: {e}")
+                    break
 
     async def _listen(self, ws):
-        while True:
+        async for message in ws:
+            if str(message).strip() == "pong":
+                logging.debug("Pong received")
+                continue
+
             try:
-                # Wenn 60 Sek keine Nachricht (auch kein automatischer Pong) kommt: Timeout!
-                message = await asyncio.wait_for(ws.recv(), timeout=60)
-                
-                if str(message).strip() == "pong":
-                    logging.debug("Pong received")
-                    continue
-
                 data = json.loads(message)
+            except json.JSONDecodeError:
+                logging.error(f"Could not decode JSON: {message}")
+                continue
             
-                # 1. Event handling
-                event = data.get("event")
+            # 1. Event handling
+            event = data.get("event")
 
-                # 2. Check login confirmation
-                if event == "login":
-                    code = data.get("code")
-                    if code == 0 or code == "00000":
-                        logging.info("Bitget Login Confirmed. Sending Subscription now...")
-                        await self._subscribe(ws)
-                    else:
-                        logging.error(f"Bitget Login Failed with code: {code}")
+            # 2. Check login confirmation
+            if event == "login":
+                code = data.get("code")
+                if code == 0 or code == "00000":
+                    logging.info("Bitget Login Confirmed. Sending Subscription now...")
+                    await self._subscribe(ws)
+                else:
+                    logging.error(f"Bitget Login Failed with code: {code}")
 
-                elif event == "subscribe":
-                    logging.info(f"Subscription confirmed for: {data.get('arg')}")
+            elif event == "subscribe":
+                logging.info(f"Subscription confirmed for: {data.get('arg')}")
 
-                elif event == "error":
-                    logging.error(f"BITGET WS ERROR: {data}")
+            elif event == "error":
+                logging.error(f"BITGET WS ERROR: {data}")
 
-                # 4. Process push messages
-                channel = data.get("arg", {}).get("channel")
-                
-                if channel == "orders":
-                    order_data_list = data.get("data", [])
-                    for order in order_data_list:
-                        status = order.get("status")
-                        if status == "filled":
-                            client_id = order.get("clientOid")
-                            order_id = order.get("orderId")
-                            symbol = order.get("instId")
-                            
-                            logging.info(f"ORDER FILLED. ID: {order_id}, ClientID: {client_id}")
+            # 4. Process push messages
+            channel = data.get("arg", {}).get("channel")
+            
+            if channel == "orders":
+                order_data_list = data.get("data", [])
+                for order in order_data_list:
+                    status = order.get("status")
+                    if status == "filled":
+                        client_id = order.get("clientOid")
+                        order_id = order.get("orderId")
+                        symbol = order.get("instId")
+                        
+                        logging.info(f"ORDER FILLED. ID: {order_id}, ClientID: {client_id}")
 
-                            # Wichtig: Prüfen ob trigger_id existiert UND unser Prefix hat (optional, aber sicher)
-                            if client_id:
-                                await handle_tp_trigger(client_id, symbol)
-                            elif order_id:
-                                await handle_tp_trigger(order_id, symbol)
-            except asyncio.TimeoutError:
-                logging.warning("WebSocket Timeout: No Data for 60 sec. Closing Connection for reconect...")
-                raise Exception("Keep-alive timeout") # Löst den Reconnect in connect() aus
-            except Exception as e:
-                logging.error(f"Error in listen loop: {e}")
-                raise e 
+                        # Wichtig: Prüfen ob trigger_id existiert UND unser Prefix hat (optional, aber sicher)
+                        if client_id:
+                            await handle_tp_trigger(client_id, symbol)
+                        elif order_id:
+                            await handle_tp_trigger(order_id, symbol)
 
 @app.post("/process_signal")
 async def process_router_signal(update: dict):
@@ -1319,14 +1335,14 @@ async def place_take_profit_order(symbol, size, price, side):
 
 
 async def place_stop_loss_order(symbol, size, trigger_price, side: str):
-    url_path = "/api/v2/mix/order/place-plan-order"
+    url_path = "/api/v2/mix/order/place-tpsl-order"
     url = f"{BASE_URL}{url_path}"
     timestamp = str(int(time.time() * 1000))
     client_oid = f"sl_{int(time.time() * 1000)}_{os.urandom(2).hex()}"
     if side == "close_long":
-        v2_side = "buy"
+        v2_side = "long"
     elif side == "close_short":
-        v2_side = "sell"
+        v2_side = "short"
     else:
         logging.error("Invalid side for Conditional Order: %s. Expected 'close_long' or 'close_short'.", side)
         return None
@@ -1340,17 +1356,14 @@ async def place_stop_loss_order(symbol, size, trigger_price, side: str):
 
     payload = {
         "symbol": base_symbol,
-        "productType": "UMCBL",
-        "marginMode": "isolated",
+        "productType": "USDT-FUTURES",
+        "planType": "loss_plan",
         "marginCoin": "USDT",
-        "size": formatted_size,
-        "side": v2_side, 
-        "orderType": "market",
-        "planType": "normal_plan",
-        "tradeSide": "close",
-        "reduceOnly": "yes",
         "triggerPrice": formatted_trigger_price,
         "triggerType": "mark_price",
+        "executePrice": "0",
+        "size": formatted_size,
+        "holdSide": v2_side,
         "clientOid": client_oid
     }
 
